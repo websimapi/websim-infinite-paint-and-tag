@@ -1,21 +1,5 @@
 export default {
   CHUNK_SIZE: 512, // Size of each chunk in pixels
-  PLAYER_SPEED: 5,
-  PAINT_RADIUS: {
-    small: 10,
-    medium: 20,
-    large: 30,
-  },
-  PAINT_COOLDOWN: 100, // Milliseconds between paint splats
-  TAG_COST: 1000, // Score cost to place a tag
-  TAG_SIZE: 100, // Size of the tag image
-  SCORE_UPDATE_INTERVAL: 1000, // How often to recalculate scores (ms)
-  MAX_LOADED_CHUNKS: 9, // Max chunks to keep loaded around the player (3x3 grid)
-  SPECIAL_ABILITY_DURATION: 5000, // Duration of special ability in ms
-};
-
-export default {
-  CHUNK_SIZE: 512, // Size of each chunk in pixels
   PLAYER_SPEED: 4, // Slightly reduced speed
   PAINT_RADIUS: {
     small: 10,
@@ -30,4 +14,3 @@ export default {
   SPECIAL_ABILITY_DURATION: 5000, // Duration of special ability in ms
   SPECIAL_ABILITY_RADIUS_MULTIPLIER: 1.75, // How much bigger brush gets
 };
-

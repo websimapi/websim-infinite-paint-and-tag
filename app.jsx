@@ -1,1 +1,1167 @@
-{"content":"import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';\nimport { createRoot } from 'react-dom/client';\nimport { Stage, Layer, Rect, Circle, Image as KonvaImage } from 'react-konva';\nimport Konva from 'konva';\nimport config from './config.js';\n\n// Websim Setup\nconst room = new WebsimSocket();\n\n// Constants\nconst { CHUNK_SIZE, PLAYER_SPEED, PAINT_RADIUS, PAINT_COOLDOWN, TAG_COST, TAG_SIZE, SCORE_UPDATE_INTERVAL, MAX_LOADED_CHUNKS, SPECIAL_ABILITY_DURATION } = config;\nconst CHUNK_COLLECTION_PREFIX = 'chunk_v1_';\nconst TAG_COLLECTION = 'tag_v1';\n\n// Helper Functions\nconst getChunkId = (x, y) => {\n  const chunkX = Math.floor(x / CHUNK_SIZE);\n  const chunkY = Math.floor(y / CHUNK_SIZE);\n  return `${chunkX}_${chunkY}`;\n};\n\nconst getChunkCoords = (chunkId) => {\n    const [x, y] = chunkId.split('_').map(Number);\n    return { x, y };\n}\n\nconst Player = React.memo(({ player, isSelf, color }) => {\n  if (!player || typeof player.x !== 'number' || typeof player.y !== 'number') {\n      console.warn(\"Invalid player data:\", player);\n      return null;\n  }\n  return (\n    <>\n      <Circle\n        x={player.x}\n        y={player.y}\n        radius={15}\n        fill={color}\n        stroke=\"black\"\n        strokeWidth={2}\n      />\n       <KonvaImage\n        image={player.avatarImage}\n        x={player.x - 10}\n        y={player.y - 10}\n        width={20}\n        height={20}\n        cornerRadius={10}\n       />\n    </>\n  );\n});\n\nconst PaintSplat = React.memo(({ splat }) => (\n  <Circle\n    x={splat.x}\n    y={splat.y}\n    radius={splat.radius}\n    fill={splat.color}\n    opacity={0.8} // Make splats slightly transparent to see overlaps\n  />\n));\n\nconst Tag = React.memo(({ tag }) => {\n  const [image, setImage] = useState(null);\n  const [status, setStatus] = useState('loading'); // loading, loaded, error\n\n  useEffect(() => {\n      if (tag.imageUrl) {\n          const img = new window.Image();\n          img.src = tag.imageUrl;\n          img.onload = () => {\n              setImage(img);\n              setStatus('loaded');\n          };\n          img.onerror = () => {\n              console.error(\"Failed to load tag image:\", tag.imageUrl);\n              setStatus('error');\n          }\n      } else {\n          setStatus('error'); // No image URL provided\n      }\n  }, [tag.imageUrl]);\n\n  if (status === 'loading' || status === 'error' || !image) {\n      // Optionally render a placeholder while loading or on error\n      return <Rect x={tag.x - TAG_SIZE / 2} y={tag.y - TAG_SIZE / 2} width={TAG_SIZE} height={TAG_SIZE} fill=\"#ccc\" stroke=\"black\" strokeWidth={1} />;\n  }\n\n\n  return (\n    <KonvaImage\n      image={image}\n      x={tag.x - TAG_SIZE / 2}\n      y={tag.y - TAG_SIZE / 2}\n      width={TAG_SIZE}\n      height={TAG_SIZE}\n      stroke={tag.isActive ? 'gold' : 'black'} // Highlight if ability active\n      strokeWidth={tag.isActive ? 4 : 1}\n      shadowBlur={tag.isActive ? 10 : 0}\n      shadowColor={tag.isActive ? 'gold' : undefined}\n    />\n  );\n});\n\n\nconst Chunk = React.memo(({ chunkId, paintData, tags }) => {\n  const { x: chunkX, y: chunkY } = getChunkCoords(chunkId);\n  const chunkPixelX = chunkX * CHUNK_SIZE;\n  const chunkPixelY = chunkY * CHUNK_SIZE;\n\n  const paintSplats = useMemo(() => {\n      return Object.values(paintData || {}).map(splat => (\n          <PaintSplat key={splat.id} splat={splat} />\n      ));\n  }, [paintData]);\n\n   const chunkTags = useMemo(() => {\n      return tags.map(tag => (\n          <Tag key={tag.id} tag={tag} />\n      ));\n  }, [tags]);\n\n\n  return (\n    <>\n      {/* Optional: Chunk border for debugging */}\n       {/* <Rect\n        x={chunkPixelX}\n        y={chunkPixelY}\n        width={CHUNK_SIZE}\n        height={CHUNK_SIZE}\n        stroke=\"lightgray\"\n        strokeWidth={1}\n        listening={false} // Don't interfere with clicks\n      /> */}\n      {paintSplats}\n      {chunkTags}\n    </>\n  );\n});\n\n\nfunction App() {\n  const [players, setPlayers] = useState({});\n  const [selfState, setSelfState] = useState({ x: window.innerWidth / 2, y: window.innerHeight / 2, color: '#FF0000', brush: 'medium', score: 0, specialAbilityActive: false, specialAbilityTimeout: null });\n  const [chunks, setChunks] = useState({}); // { chunkId: { paint: {splatId: splatData}, tags: [tagData] } }\n  const [loadedChunkIds, setLoadedChunkIds] = useState(new Set());\n  const [keysPressed, setKeysPressed] = useState({});\n  const [lastPaintTime, setLastPaintTime] = useState(0);\n  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });\n  const [isPlacingTag, setIsPlacingTag] = useState(false);\n  const [tagPrompt, setTagPrompt] = useState('');\n  const [isGeneratingTag, setIsGeneratingTag] = useState(false);\n  const [scores, setScores] = useState({}); // { username: score }\n  const stageRef = useRef(null);\n  const layerRef = useRef(null);\n\n  const selfId = room.clientId; // Get self client ID\n\n  // Fetch initial creator username if needed\n  useEffect(() => {\n    async function fetchCreator() {\n      const creator = await window.websim.getCreatedBy();\n      // You might store/use creator.username if needed for specific logic\n    }\n    fetchCreator();\n  }, []);\n\n  // Initialize room connection and subscriptions\n  useEffect(() => {\n    const initialize = async () => {\n      await room.initialize();\n\n      // Set initial presence\n      const initialAvatar = new window.Image();\n      initialAvatar.src = room.peers[selfId]?.avatarUrl || ''; // Use fetched avatar URL\n      initialAvatar.onload = () => {\n          room.updatePresence({\n              ...selfState,\n              avatarImage: initialAvatar, // Store loaded image object\n          });\n          setSelfState(prev => ({...prev, avatarImage: initialAvatar}));\n      };\n       initialAvatar.onerror = () => {\n          console.error(\"Failed to load own avatar\");\n          // Optionally set a placeholder avatar\n          room.updatePresence({ ...selfState, avatarImage: null });\n          setSelfState(prev => ({...prev, avatarImage: null}));\n      };\n\n\n      // Subscribe to presence updates (other players)\n      room.subscribePresence(async (presence) => {\n        const updatedPlayers = {};\n        for (const [clientId, playerData] of Object.entries(presence)) {\n            if (playerData && room.peers[clientId]) {\n                // Ensure avatar image is loaded\n                if (playerData.avatarImage instanceof window.Image || !room.peers[clientId].avatarUrl) {\n                     updatedPlayers[clientId] = { ...playerData, username: room.peers[clientId].username };\n                } else {\n                    // Load avatar if not already loaded (or if URL changed)\n                    const avatar = new window.Image();\n                    avatar.src = room.peers[clientId].avatarUrl;\n                    await new Promise((resolve, reject) => {\n                       avatar.onload = resolve;\n                       avatar.onerror = reject;\n                    });\n                    updatedPlayers[clientId] = { ...playerData, username: room.peers[clientId].username, avatarImage: avatar };\n                }\n            }\n        }\n        setPlayers(updatedPlayers);\n      });\n\n\n      // Subscribe to tag updates\n      room.collection(TAG_COLLECTION).subscribe((allTags) => {\n        setChunks(prevChunks => {\n          const newChunks = { ...prevChunks };\n          // Clear existing tags from all chunks first\n           Object.keys(newChunks).forEach(cId => {\n               if (newChunks[cId]) newChunks[cId].tags = [];\n           });\n          // Distribute new tags into relevant chunks\n          allTags.forEach(tag => {\n            const chunkId = getChunkId(tag.x, tag.y);\n            if (!newChunks[chunkId]) {\n                newChunks[chunkId] = { paint: {}, tags: [] }; // Initialize if chunk doesn't exist\n            }\n             if (!newChunks[chunkId].tags) { // Ensure tags array exists\n                 newChunks[chunkId].tags = [];\n             }\n            newChunks[chunkId].tags.push(tag);\n          });\n          return newChunks;\n        });\n      });\n\n      // Initial chunk load based on starting position\n      loadChunksAround(selfState.x, selfState.y);\n\n    };\n    initialize();\n\n     // Cleanup subscriptions on unmount\n     return () => {\n         // room.unsubscribePresence(); // Assuming unsubscribe methods exist\n         // room.collection(TAG_COLLECTION).unsubscribe();\n         // loadedChunkIds.forEach(id => room.collection(getChunkCollectionName(id)).unsubscribe());\n         // Note: Actual unsubscribe might need storing the return values of subscribe calls\n     };\n  }, []); // Run only once on mount\n\n\n  // Handle player movement\n  useEffect(() => {\n    const interval = setInterval(() => {\n      let dx = 0;\n      let dy = 0;\n      if (keysPressed['w'] || keysPressed['ArrowUp']) dy -= PLAYER_SPEED;\n      if (keysPressed['s'] || keysPressed['ArrowDown']) dy += PLAYER_SPEED;\n      if (keysPressed['a'] || keysPressed['ArrowLeft']) dx -= PLAYER_SPEED;\n      if (keysPressed['d'] || keysPressed['ArrowRight']) dx += PLAYER_SPEED;\n\n      if (dx !== 0 || dy !== 0) {\n        setSelfState(prev => {\n          const newX = prev.x + dx;\n          const newY = prev.y + dy;\n\n          // Update presence\n          room.updatePresence({ x: newX, y: newY });\n\n           // Check for standing on own active tag\n           const isOnOwnActiveTag = Object.values(chunks)\n                .flatMap(chunk => chunk.tags || [])\n                .some(tag => tag.username === room.peers[selfId]?.username &&\n                             Math.hypot(newX - tag.x, newY - tag.y) < TAG_SIZE / 2);\n\n\n           let specialAbilityActive = prev.specialAbilityActive;\n           let specialAbilityTimeout = prev.specialAbilityTimeout;\n\n           if (isOnOwnActiveTag && !prev.specialAbilityActive) {\n                console.log(\"Activating special ability!\");\n                specialAbilityActive = true;\n                // Clear any existing timeout\n                if (prev.specialAbilityTimeout) clearTimeout(prev.specialAbilityTimeout);\n                // Set a new timeout to deactivate the ability\n                specialAbilityTimeout = setTimeout(() => {\n                    console.log(\"Deactivating special ability\");\n                    setSelfState(s => ({...s, specialAbilityActive: false, specialAbilityTimeout: null}));\n                    room.updatePresence({ specialAbilityActive: false }); // Update presence too\n                }, SPECIAL_ABILITY_DURATION);\n                 room.updatePresence({ specialAbilityActive: true });\n           }\n\n\n          // Trigger chunk loading if necessary\n           loadChunksAround(newX, newY);\n\n          // Center stage on player\n           if(stageRef.current) {\n               const container = stageRef.current.container();\n               setStagePos({\n                   x: -newX + container.offsetWidth / 2,\n                   y: -newY + container.offsetHeight / 2,\n               });\n           }\n\n\n          return { ...prev, x: newX, y: newY, specialAbilityActive, specialAbilityTimeout };\n        });\n      }\n       // Check if special ability needs deactivation due to timeout ending *without* moving\n       else if (selfState.specialAbilityActive && !selfState.specialAbilityTimeout) {\n            // This state means the timeout fired, but the player hasn't moved since\n            console.log(\"Deactivating special ability (no movement)\");\n             setSelfState(s => ({...s, specialAbilityActive: false }));\n             room.updatePresence({ specialAbilityActive: false });\n       }\n\n    }, 16); // ~60 FPS\n\n    return () => clearInterval(interval);\n  }, [keysPressed, selfState.x, selfState.y, selfState.specialAbilityActive, selfState.specialAbilityTimeout, chunks]); // Re-run if keys or position changes\n\n   // Keyboard event listeners\n   useEffect(() => {\n     const handleKeyDown = (e) => {\n        if (e.key === 't' && !isPlacingTag && !isGeneratingTag && selfState.score >= TAG_COST) {\n            setIsPlacingTag(true);\n        } else if (e.key === 'Escape' && isPlacingTag) {\n             setIsPlacingTag(false);\n             setTagPrompt('');\n        } else if (!isPlacingTag) { // Only handle movement/paint if not placing tag\n             setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: true }));\n             // Handle painting on keydown (if applicable, or use mouse click)\n             if (e.key === ' ') { // Example: Paint with spacebar\n                 handlePaint();\n             }\n        }\n     };\n     const handleKeyUp = (e) => {\n        if (!isPlacingTag) {\n            setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: false }));\n        }\n     };\n\n     window.addEventListener('keydown', handleKeyDown);\n     window.addEventListener('keyup', handleKeyUp);\n\n     return () => {\n       window.removeEventListener('keydown', handleKeyDown);\n       window.removeEventListener('keyup', handleKeyUp);\n     };\n   }, [isPlacingTag, isGeneratingTag, selfState.score]); // Add dependencies\n\n   // Mouse click/drag painting\n   useEffect(() => {\n       const stage = stageRef.current;\n       if (!stage) return;\n\n       let isPainting = false;\n\n       const handleMouseDown = () => {\n           if (!isPlacingTag) { // Don't paint while placing tag\n               isPainting = true;\n               handlePaint(); // Paint on initial click\n           }\n       };\n\n       const handleMouseMove = () => {\n           if (isPainting) {\n               handlePaint(); // Paint continuously while dragging\n           }\n       };\n\n       const handleMouseUp = () => {\n           isPainting = false;\n       };\n\n\n       stage.on('mousedown', handleMouseDown);\n       stage.on('mousemove', handleMouseMove);\n       stage.on('mouseup', handleMouseUp);\n       stage.on('mouseleave', handleMouseUp); // Stop painting if mouse leaves canvas\n\n\n       return () => {\n           stage.off('mousedown', handleMouseDown);\n           stage.off('mousemove', handleMouseMove);\n           stage.off('mouseup', handleMouseUp);\n           stage.off('mouseleave', handleMouseUp);\n       };\n   }, [handlePaint, isPlacingTag]); // Re-attach if handlePaint or isPlacingTag changes\n\n\n    // Chunk Loading Logic\n    const loadChunksAround = useCallback((worldX, worldY) => {\n        const currentChunkId = getChunkId(worldX, worldY);\n        const { x: currentChunkX, y: currentChunkY } = getChunkCoords(currentChunkId);\n        const neededChunks = new Set();\n        const chunksToUnload = new Set(loadedChunkIds);\n\n        // Determine chunks needed around the player (e.g., 3x3 grid)\n        for (let dx = -1; dx <= 1; dx++) {\n            for (let dy = -1; dy <= 1; dy++) {\n                const chunkId = `${currentChunkX + dx}_${currentChunkY + dy}`;\n                neededChunks.add(chunkId);\n                chunksToUnload.delete(chunkId); // Don't unload chunks that are still needed\n            }\n        }\n\n        // Load new chunks\n        neededChunks.forEach(chunkId => {\n            if (!loadedChunkIds.has(chunkId)) {\n                // console.log(\"Loading chunk:\", chunkId);\n                const collectionName = getChunkCollectionName(chunkId);\n                // Subscribe to paint data for this chunk\n                room.collection(collectionName).subscribe((paintSplats) => {\n                    setChunks(prev => ({\n                        ...prev,\n                        [chunkId]: {\n                            ...(prev[chunkId] || { tags: [] }), // Preserve existing tags\n                            paint: paintSplats.reduce((acc, splat) => {\n                                acc[splat.id] = splat;\n                                return acc;\n                            }, {})\n                        }\n                    }));\n                });\n                 // Also fetch tags for this chunk initially (though tag subscription handles updates)\n                 const chunkTags = room.collection(TAG_COLLECTION).filter({ chunkId }).getList();\n                 setChunks(prev => ({\n                     ...prev,\n                     [chunkId]: {\n                         ...(prev[chunkId] || { paint: {} }), // Preserve existing paint\n                         tags: chunkTags\n                     }\n                 }));\n\n\n                setLoadedChunkIds(prev => new Set(prev).add(chunkId));\n            }\n        });\n\n         // Unload and unsubscribe from chunks that are too far away\n         chunksToUnload.forEach(chunkId => {\n             // console.log(\"Unloading chunk:\", chunkId);\n             // room.collection(getChunkCollectionName(chunkId)).unsubscribe(); // Need to store unsubscribe handle\n             setLoadedChunkIds(prev => {\n                 const newSet = new Set(prev);\n                 newSet.delete(chunkId);\n                 return newSet;\n             });\n             // Optionally remove chunk data from state to save memory\n             // setChunks(prev => {\n             //     const newChunks = { ...prev };\n             //     delete newChunks[chunkId];\n             //     return newChunks;\n             // });\n         });\n\n    }, [loadedChunkIds]); // Dependencies for chunk loading\n\n    const getChunkCollectionName = (chunkId) => `${CHUNK_COLLECTION_PREFIX}${chunkId}`;\n\n    // Painting Logic\n    const handlePaint = useCallback(() => {\n        const now = Date.now();\n        if (now - lastPaintTime < PAINT_COOLDOWN) return; // Throttle painting\n\n        const { x, y, color, brush, specialAbilityActive } = selfState;\n        const chunkId = getChunkId(x, y);\n        const collectionName = getChunkCollectionName(chunkId);\n        let radius = PAINT_RADIUS[brush];\n\n        // Apply special ability effect (e.g., larger brush)\n         if (specialAbilityActive) {\n             radius *= 1.5; // Example: 50% larger radius\n             // Add more effects? Faster cooldown?\n         }\n\n        // Create paint splat record\n        room.collection(collectionName).create({\n            x: x,\n            y: y,\n            color: color,\n            radius: radius,\n            username: room.peers[selfId]?.username || 'unknown', // Store username with splat\n            timestamp: now, // Add timestamp for potential score calculation logic\n        });\n\n        setLastPaintTime(now);\n\n    }, [lastPaintTime, selfState, selfId]);\n\n    // Tag Placement Logic\n    const handlePlaceTag = useCallback(async () => {\n         if (!tagPrompt || isGeneratingTag || selfState.score < TAG_COST) return;\n\n         setIsGeneratingTag(true);\n         setIsPlacingTag(false); // Close input UI\n\n         try {\n             console.log(\"Generating tag image for prompt:\", tagPrompt);\n             const imageResult = await websim.imageGen({\n                 prompt: tagPrompt,\n                 aspect_ratio: \"1:1\", // Ensure square tags\n             });\n\n             if (!imageResult || !imageResult.url) {\n                 throw new Error(\"Image generation failed or returned no URL.\");\n             }\n             console.log(\"Tag image generated:\", imageResult.url);\n\n\n             const { x, y } = selfState;\n             const chunkId = getChunkId(x, y); // Associate tag with chunk\n\n             // Create tag record\n             await room.collection(TAG_COLLECTION).create({\n                 x: x,\n                 y: y,\n                 chunkId: chunkId,\n                 prompt: tagPrompt,\n                 imageUrl: imageResult.url,\n                 username: room.peers[selfId]?.username || 'unknown',\n                 timestamp: Date.now(),\n             });\n\n              // Deduct score - update locally first for responsiveness\n              const newScore = selfState.score - TAG_COST;\n              setSelfState(prev => ({ ...prev, score: newScore }));\n              // Optionally update presence immediately with new score\n              room.updatePresence({ score: newScore });\n              // Score recalculation will confirm this later\n\n\n             console.log(\"Tag placed successfully at\", x, y);\n\n\n         } catch (error) {\n             console.error(\"Error placing tag:\", error);\n             // Add user feedback here (e.g., display an error message)\n         } finally {\n             setIsGeneratingTag(false);\n             setTagPrompt(''); // Clear prompt\n         }\n     }, [tagPrompt, isGeneratingTag, selfState, selfId]);\n\n    // Score Calculation Logic\n    useEffect(() => {\n        const calculateScores = () => {\n            const newScores = {};\n            const allUsernames = new Set(Object.values(players).map(p => p.username).filter(Boolean));\n            if(room.peers[selfId]?.username) {\n                allUsernames.add(room.peers[selfId].username);\n            }\n\n\n            allUsernames.forEach(username => newScores[username] = 0);\n\n            // Iterate through loaded chunks and their paint data\n            Object.values(chunks).forEach(chunk => {\n                if (chunk && chunk.paint) {\n                    // Sort paint splats by timestamp ascending (older first)\n                     const sortedSplats = Object.values(chunk.paint).sort((a, b) => a.timestamp - b.timestamp);\n\n                     // Create a temporary canvas for pixel checking (more accurate scoring)\n                     const scoreCanvas = document.createElement('canvas');\n                     scoreCanvas.width = CHUNK_SIZE;\n                     scoreCanvas.height = CHUNK_SIZE;\n                     const ctx = scoreCanvas.getContext('2d', { willReadFrequently: true });\n                     if (!ctx) return; // Skip if context creation fails\n\n                     // Draw all splats onto the temporary canvas\n                     sortedSplats.forEach(splat => {\n                          const chunkCoord = getChunkCoords(getChunkId(splat.x, splat.y));\n                          ctx.fillStyle = splat.color; // Use color to identify user later (or store username directly)\n                          ctx.beginPath();\n                          ctx.arc(splat.x - chunkCoord.x * CHUNK_SIZE, splat.y - chunkCoord.y * CHUNK_SIZE, splat.radius, 0, Math.PI * 2);\n                          ctx.fill();\n                     });\n\n                     // Sample pixels to determine dominant color (owner) - This is intensive!\n                     // A simpler (less accurate) method: Iterate splats newest first. For each splat,\n                     // calculate its area. Subtract areas of newer splats that overlap it significantly.\n                     // This avoids pixel manipulation but is less precise about partial overlaps.\n\n                     // --- Simpler Scoring Method (Area-based, newest wins) ---\n                     const reversedSplats = [...sortedSplats].reverse(); // Newest first\n                     const coveredPoints = new Set(); // Store string \"x,y\" of covered pixels/areas\n\n                     reversedSplats.forEach(splat => {\n                         if (!newScores[splat.username]) newScores[splat.username] = 0;\n                         const splatChunkCoords = getChunkCoords(getChunkId(splat.x, splat.y));\n                         const localX = splat.x - splatChunkCoords.x * CHUNK_SIZE;\n                         const localY = splat.y - splatChunkCoords.y * CHUNK_SIZE;\n                         let visibleArea = 0;\n                         const step = Math.max(1, Math.floor(splat.radius / 5)); // Sample points within the splat\n\n                         for (let dx = -splat.radius; dx <= splat.radius; dx += step) {\n                            for (let dy = -splat.radius; dy <= splat.radius; dy += step) {\n                                if (dx*dx + dy*dy <= splat.radius * splat.radius) { // Check if inside circle\n                                      const checkX = Math.floor(localX + dx);\n                                      const checkY = Math.floor(localY + dy);\n                                      const pointKey = `${checkX},${checkY}`;\n                                      if (!coveredPoints.has(pointKey)) {\n                                          visibleArea += step * step; // Approximate area contribution\n                                          coveredPoints.add(pointKey);\n                                      }\n                                }\n                            }\n                         }\n                         newScores[splat.username] += visibleArea; // Add score based on visible area\n                     });\n                }\n            });\n\n             // Adjust scores based on tags placed (cost already deducted locally)\n             Object.values(chunks).forEach(chunk => {\n                 (chunk?.tags || []).forEach(tag => {\n                      if(newScores[tag.username] !== undefined){\n                           // Cost is deducted on placement, so no adjustment needed here\n                           // unless reconciling after disconnect/reconnect\n                      }\n                 });\n             });\n\n\n            setScores(newScores);\n\n            // Update self score locally and in presence if changed significantly\n            const newSelfScore = Math.floor(newScores[room.peers[selfId]?.username] || 0);\n             if (Math.abs(newSelfScore - selfState.score) > 10) { // Update if score changed noticeably\n                 setSelfState(prev => ({ ...prev, score: newSelfScore }));\n                 room.updatePresence({ score: newSelfScore });\n             }\n        };\n\n        const scoreInterval = setInterval(calculateScores, SCORE_UPDATE_INTERVAL);\n        return () => clearInterval(scoreInterval);\n\n    }, [chunks, players, selfState.score, selfId]); // Recalculate when chunks, players, or self score changes\n\n    // Prepare sorted scores for display\n    const sortedScores = useMemo(() => {\n        return Object.entries(scores)\n            .map(([username, score]) => {\n                // Find the player's avatar\n                const playerEntry = Object.values(players).find(p => p.username === username);\n                const avatarUrl = playerEntry ? room.peers[playerEntry.id]?.avatarUrl : (username === room.peers[selfId]?.username ? room.peers[selfId]?.avatarUrl : ''); // Fallback for self\n                return { username, score: Math.floor(score), avatarUrl };\n            })\n            .sort((a, b) => b.score - a.score); // Sort descending\n    }, [scores, players, selfId, room.peers]);\n\n\n  // Konva rendering\n  const selfPlayer = players[selfId] ? { ...players[selfId], ...selfState } : selfState;\n\n\n  return (\n    <div>\n       <div className=\"controls\">\n           <label htmlFor=\"color\">Color:</label>\n           <input\n               type=\"color\"\n               id=\"color\"\n               value={selfState.color}\n               onChange={(e) => {\n                   setSelfState(prev => ({ ...prev, color: e.target.value }));\n                   room.updatePresence({ color: e.target.value });\n               }}\n           />\n           <label htmlFor=\"brush\">Brush:</label>\n           <select\n                id=\"brush\"\n                value={selfState.brush}\n                onChange={(e) => {\n                     setSelfState(prev => ({ ...prev, brush: e.target.value }));\n                     room.updatePresence({ brush: e.target.value });\n                 }}\n           >\n                <option value=\"small\">Small</option>\n                <option value=\"medium\">Medium</option>\n                <option value=\"large\">Large</option>\n           </select>\n            <span>Score: {selfState.score}</span>\n            <button onClick={() => setIsPlacingTag(true)} disabled={selfState.score < TAG_COST || isPlacingTag || isGeneratingTag}>\n                 Place Tag (Cost: {TAG_COST}) {isGeneratingTag ? '(Generating...)' : ''}\n            </button>\n            {selfState.specialAbilityActive && <span style={{color: 'gold', fontWeight: 'bold'}}> SPECIAL ACTIVE!</span>}\n       </div>\n\n        <div className=\"score-board\">\n             <h3>Scores</h3>\n             {sortedScores.map(({ username, score, avatarUrl }) => (\n                 <div key={username}>\n                     <img src={avatarUrl || 'https://images.websim.ai/default-avatar.png'} alt={username} />\n                     <span>{username}: {score}</span>\n                 </div>\n             ))}\n         </div>\n\n\n       {isPlacingTag && (\n          <div className=\"tag-input\">\n              <input\n                  type=\"text\"\n                  placeholder=\"Enter tag description (e.g., 'a happy cat')\"\n                  value={tagPrompt}\n                  onChange={(e) => setTagPrompt(e.target.value)}\n                  autoFocus\n              />\n              <button onClick={handlePlaceTag} disabled={!tagPrompt || isGeneratingTag}>\n                 {isGeneratingTag ? 'Generating...' : 'Create Tag'}\n              </button>\n              <button onClick={() => setIsPlacingTag(false)} style={{marginLeft: '5px', backgroundColor: '#f44336'}}>Cancel</button>\n          </div>\n       )}\n\n      <Stage\n        width={window.innerWidth}\n        height={window.innerHeight}\n        x={stagePos.x}\n        y={stagePos.y}\n        ref={stageRef}\n      >\n        <Layer ref={layerRef}>\n          {/* Render Chunks */}\n          {Array.from(loadedChunkIds).map(chunkId => (\n            <Chunk\n              key={chunkId}\n              chunkId={chunkId}\n              paintData={chunks[chunkId]?.paint || {}}\n              tags={chunks[chunkId]?.tags || []}\n            />\n          ))}\n\n           {/* Render Players */}\n           {Object.entries(players).map(([id, player]) => {\n               // Don't render self twice if self is in players list\n               if (id === selfId) return null;\n               // Check if player has valid coordinates before rendering\n               if (player && typeof player.x === 'number' && typeof player.y === 'number') {\n                   const playerColor = player.color || '#888888'; // Default color if missing\n                   return <Player key={id} player={player} isSelf={false} color={playerColor} />;\n               }\n               return null; // Skip rendering if player data is incomplete\n           })}\n           {/* Render Self (guaranteed to have selfState) */}\n            <Player player={selfPlayer} isSelf={true} color={selfState.color} />\n\n        </Layer>\n      </Stage>\n    </div>\n  );\n}\n\nconst container = document.getElementById('root');\nconst root = createRoot(container);\nroot.render(<App />);\n`````` index.html\n<!DOCTYPE html>\n<html>\n<head>\n  <title>Infinite Paint and Tag</title>\n  <script type=\"importmap\">\n    {\n      \"imports\": {\n        \"react\": \"https://unpkg.com/react@18/umd/react.development.js\",\n        \"react-dom/client\": \"https://unpkg.com/react-dom@18/umd/react-dom.development.js\",\n        \"react-konva\": \"https://unpkg.com/react-konva@18.2.10/umd/react-konva.min.js\",\n        \"konva\": \"https://unpkg.com/konva@9.3.1/konva.min.js\"\n      }\n    }\n  </script>\n  <link rel=\"stylesheet\" href=\"style.css\">\n  <script src=\"https://unpkg.com/@babel/standalone/babel.min.js\"></script>\n  <script src=\"https://cdn.jsdelivr.net/npm/websim@^0.6/dist/index.umd.js\"></script>\n</head>\n<body>\n  <div id=\"root\"></div>\n  <script type=\"text/babel\" data-type=\"module\" src=\"app.jsx\"></script>\n</body>\n</html>\n\nimport React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';\nimport { createRoot } from 'react-dom/client';\nimport { Stage, Layer, Rect, Circle, Image as KonvaImage, Text } from 'react-konva';\nimport Konva from 'konva';\nimport config from './config.js';\n\n// Websim Setup\nconst room = new WebsimSocket();\n\n// Constants & Config Destructuring\nconst {\n    CHUNK_SIZE, PLAYER_SPEED, PAINT_RADIUS, PAINT_COOLDOWN, TAG_COST,\n    TAG_SIZE, SCORE_UPDATE_INTERVAL, SPECIAL_ABILITY_DURATION,\n    SPECIAL_ABILITY_RADIUS_MULTIPLIER\n} = config;\nconst CHUNK_COLLECTION_PREFIX = 'chunk_paint_v2_'; // Incremented version for schema safety\nconst TAG_COLLECTION = 'tag_v2'; // Incremented version\n\n// Helper Functions\nconst getChunkId = (x, y) => {\n  const chunkX = Math.floor(x / CHUNK_SIZE);\n  const chunkY = Math.floor(y / CHUNK_SIZE);\n  return `${chunkX}_${chunkY}`;\n};\n\nconst getChunkCoords = (chunkId) => {\n    const [x, y] = chunkId.split('_').map(Number);\n    return { x, y };\n};\n\nconst getChunkCollectionName = (chunkId) => `${CHUNK_COLLECTION_PREFIX}${chunkId}`;\n\n\n// --- React Components ---\n\nconst Player = React.memo(({ player, isSelf, color, username, avatarImage }) => {\n  if (!player || typeof player.x !== 'number' || typeof player.y !== 'number') {\n      console.warn(\"Invalid player data:\", player);\n      return null;\n  }\n  const radius = 15;\n  return (\n    <>\n      <Circle\n        x={player.x}\n        y={player.y}\n        radius={radius}\n        fill={color}\n        stroke={player.specialAbilityActive ? 'gold' : \"black\"} // Highlight if ability active\n        strokeWidth={player.specialAbilityActive ? 3 : 1.5}\n        shadowBlur={player.specialAbilityActive ? 8 : 0}\n        shadowColor={player.specialAbilityActive ? 'gold' : undefined}\n        shadowOpacity={0.9}\n      />\n       {avatarImage && (\n            <KonvaImage\n                image={avatarImage}\n                x={player.x - radius * 0.7} // Center image within circle\n                y={player.y - radius * 0.7}\n                width={radius * 1.4}\n                height={radius * 1.4}\n                cornerRadius={radius * 0.7} // Make it circular\n                listening={false} // Don't block clicks on player\n            />\n       )}\n       {/* Display username above player */}\n       <Text\n            text={username}\n            x={player.x}\n            y={player.y - radius - 14} // Position above the circle\n            fontSize={12}\n            fill=\"#333\"\n            align=\"center\"\n            width={100} // Give some width for centering\n            offsetX={50} // Center the text block\n            listening={false}\n       />\n    </>\n  );\n});\n\nconst PaintSplat = React.memo(({ splat }) => (\n  <Circle\n    x={splat.x}\n    y={splat.y}\n    radius={splat.radius}\n    fill={splat.color}\n    opacity={0.75} // Slightly less transparent\n    listening={false} // Optimization: Splats don't need events\n  />\n));\n\nconst Tag = React.memo(({ tag, isAbilitySource }) => {\n  const [image, setImage] = useState(null);\n  const [status, setStatus] = useState('loading'); // loading, loaded, error\n\n  useEffect(() => {\n      if (tag.imageUrl && tag.imageUrl !== image?.src) { // Load only if URL exists and changed\n          setStatus('loading');\n          const img = new window.Image();\n          img.crossOrigin = \"Anonymous\"; // Needed for potential canvas operations if tags overlap score areas\n          img.src = tag.imageUrl;\n          img.onload = () => {\n              setImage(img);\n              setStatus('loaded');\n          };\n          img.onerror = () => {\n              console.error(\"Failed to load tag image:\", tag.imageUrl);\n              setStatus('error');\n          }\n      } else if (!tag.imageUrl) {\n          setStatus('error'); // No image URL provided\n      }\n  }, [tag.imageUrl, image?.src]); // Depend on URL and current image src\n\n  const borderStroke = isAbilitySource ? 'gold' : 'black';\n  const borderStrokeWidth = isAbilitySource ? 4 : 1;\n  const shadow = isAbilitySource ? 10 : 0;\n\n  // Common props for placeholder and image\n  const commonProps = {\n      x: tag.x - TAG_SIZE / 2,\n      y: tag.y - TAG_SIZE / 2,\n      width: TAG_SIZE,\n      height: TAG_SIZE,\n      stroke: borderStroke,\n      strokeWidth: borderStrokeWidth,\n      shadowBlur: shadow,\n      shadowColor: 'gold',\n      shadowOpacity: 0.8,\n      listening: false, // Tags generally don't need events\n  };\n\n  if (status === 'loading' || status === 'error' || !image) {\n      return <Rect {...commonProps} fill=\"#ddd\" />;\n  }\n\n  return (\n    <KonvaImage\n      image={image}\n      {...commonProps}\n    />\n  );\n});\n\n\nconst Chunk = React.memo(({ chunkId, paintData, tags, activePlayerTags }) => {\n  const { x: chunkX, y: chunkY } = getChunkCoords(chunkId);\n  const chunkPixelX = chunkX * CHUNK_SIZE;\n  const chunkPixelY = chunkY * CHUNK_SIZE;\n\n  // Memoize paint splats based only on paintData object identity\n  const paintSplats = useMemo(() => {\n      // console.log(`Memoizing paint for chunk ${chunkId}`);\n      return Object.values(paintData || {}).map(splat => (\n          <PaintSplat key={splat.id} splat={splat} />\n      ));\n  }, [paintData]); // Dependency array includes only paintData\n\n   // Memoize tags based on tags array identity and active player tags set\n   const chunkTags = useMemo(() => {\n    // console.log(`Memoizing tags for chunk ${chunkId}`);\n      return tags.map(tag => (\n          <Tag\n            key={tag.id}\n            tag={tag}\n            isAbilitySource={activePlayerTags.has(tag.id)}\n          />\n      ));\n  }, [tags, activePlayerTags]); // Dependency array includes tags and activePlayerTags\n\n\n  return (\n    <>\n      {/* Optional: Chunk border for debugging\n       <Rect\n        x={chunkPixelX}\n        y={chunkPixelY}\n        width={CHUNK_SIZE}\n        height={CHUNK_SIZE}\n        stroke=\"lightgray\"\n        strokeWidth={1}\n        listening={false} // Don't interfere with clicks\n        opacity={0.5}\n      /> */}\n      {paintSplats}\n      {chunkTags}\n    </>\n  );\n});\n\n\nfunction App() {\n  const [players, setPlayers] = useState({}); // { clientId: { x, y, color, brush, score, username, avatarImage, specialAbilityActive } }\n  const [selfState, setSelfState] = useState({ x: window.innerWidth / 2, y: window.innerHeight / 2, color: '#FF0000', brush: 'medium', score: 0, specialAbilityActive: false, specialAbilityTimeout: null });\n  const [chunks, setChunks] = useState({}); // { chunkId: { paint: {splatId: splatData}, tags: [tagData] } }\n  const [loadedChunkIds, setLoadedChunkIds] = useState(new Set());\n  const [chunkSubscriptions, setChunkSubscriptions] = useState({}); // { chunkId: unsubscribeFn }\n  const [tagSubscription, setTagSubscription] = useState(null);\n  const [presenceSubscription, setPresenceSubscription] = useState(null);\n  const [keysPressed, setKeysPressed] = useState({});\n  const [lastPaintTime, setLastPaintTime] = useState(0);\n  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });\n  const [isPlacingTag, setIsPlacingTag] = useState(false);\n  const [tagPrompt, setTagPrompt] = useState('');\n  const [isGeneratingTag, setIsGeneratingTag] = useState(false);\n  const [scores, setScores] = useState({}); // { username: score }\n  const [playerAvatars, setPlayerAvatars] = useState({}); // { clientId: ImageObject }\n  const [activePlayerTags, setActivePlayerTags] = useState(new Set()); // Set of tag IDs the player is currently standing on for ability\n  const stageRef = useRef(null);\n  const layerRef = useRef(null);\n  const selfId = useRef(null); // Store selfId in ref after initialization\n  const selfUsername = useRef(null); // Store self username\n  const isInitialized = useRef(false);\n\n\n  // --- Initialization and Subscriptions ---\n\n  useEffect(() => {\n    if (isInitialized.current) return;\n    isInitialized.current = true; // Prevent re-initialization\n\n    const initialize = async () => {\n      console.log(\"Initializing Websim connection...\");\n      await room.initialize();\n      selfId.current = room.clientId; // Store self ID\n      selfUsername.current = room.peers[selfId.current]?.username || 'Player';\n      console.log(\"Initialization complete. Self ID:\", selfId.current, \"Username:\", selfUsername.current);\n\n      // Set initial presence with loaded avatar\n      const initialAvatar = await loadAvatar(room.peers[selfId.current]?.avatarUrl);\n      setPlayerAvatars(prev => ({ ...prev, [selfId.current]: initialAvatar }));\n      const initialPresence = {\n          x: selfState.x,\n          y: selfState.y,\n          color: selfState.color,\n          brush: selfState.brush,\n          score: selfState.score,\n          specialAbilityActive: selfState.specialAbilityActive,\n          // avatarImage is not directly synced, derived from peers\n      };\n      room.updatePresence(initialPresence);\n      console.log(\"Initial presence sent:\", initialPresence);\n\n      // Subscribe to presence updates\n      const unsubPresence = room.subscribePresence(handlePresenceUpdate);\n      setPresenceSubscription(() => unsubPresence);\n\n      // Subscribe to tag updates\n      const unsubTags = room.collection(TAG_COLLECTION).subscribe(handleTagUpdate);\n      setTagSubscription(() => unsubTags);\n\n      // Initial chunk load based on starting position\n      loadChunksAround(selfState.x, selfState.y);\n      centerStageOnPlayer(selfState.x, selfState.y); // Center initially\n    };\n\n    initialize().catch(err => console.error(\"Initialization failed:\", err));\n\n    // Cleanup function\n    return () => {\n      console.log(\"Cleaning up subscriptions...\");\n      presenceSubscription?.();\n      tagSubscription?.();\n      Object.values(chunkSubscriptions).forEach(unsub => unsub?.()); // Unsubscribe from all chunk listeners\n      // Clear special ability timeout if active\n      if (selfState.specialAbilityTimeout) {\n          clearTimeout(selfState.specialAbilityTimeout);\n      }\n    };\n  }, []); // Empty dependency array ensures this runs only once\n\n  // --- Data Update Handlers ---\n\n  const loadAvatar = async (url) => {\n      if (!url) return null;\n      return new Promise((resolve) => {\n          const img = new window.Image();\n          img.crossOrigin = \"Anonymous\";\n          img.src = url;\n          img.onload = () => resolve(img);\n          img.onerror = () => {\n              console.warn(\"Failed to load avatar:\", url);\n              resolve(null); // Resolve with null on error\n          }\n      });\n  };\n\n\n  const handlePresenceUpdate = useCallback(async (presence) => {\n    // console.log(\"Presence update received:\", presence);\n    const updatedPlayers = {};\n    const avatarPromises = [];\n\n    for (const [clientId, playerData] of Object.entries(presence)) {\n        if (playerData && room.peers[clientId]) { // Ensure player exists in peers\n            const username = room.peers[clientId].username;\n            updatedPlayers[clientId] = { ...playerData, username };\n\n            // Load avatar if not already loaded or changed\n            if (!playerAvatars[clientId] && room.peers[clientId].avatarUrl) {\n                avatarPromises.push(\n                    loadAvatar(room.peers[clientId].avatarUrl).then(img => {\n                         if (img) setPlayerAvatars(prev => ({ ...prev, [clientId]: img }));\n                    })\n                );\n            }\n        } else {\n             // If player not in peers anymore, remove their avatar\n             setPlayerAvatars(prev => {\n                 const newState = {...prev};\n                 delete newState[clientId];\n                 return newState;\n             });\n             console.log(`Player ${clientId} left or missing from peers.`);\n        }\n    }\n    // Wait for any new avatars to load before setting player state\n    await Promise.all(avatarPromises);\n    setPlayers(updatedPlayers);\n    // console.log(\"Players state updated:\", updatedPlayers);\n  }, [playerAvatars]); // Dependency on playerAvatars to avoid unnecessary avatar loading loops\n\n  const handleTagUpdate = useCallback((allTags) => {\n    // console.log(\"Tag update received:\", allTags.length, \"tags\");\n    setChunks(prevChunks => {\n        const newChunks = { ...prevChunks };\n        // Clear existing tags from all chunks first to handle deletions\n        Object.keys(newChunks).forEach(cId => {\n            if (newChunks[cId]) newChunks[cId].tags = [];\n        });\n        // Distribute new tags into relevant chunks\n        allTags.forEach(tag => {\n            const chunkId = getChunkId(tag.x, tag.y); // Use actual coords to find chunk\n            if (!newChunks[chunkId]) {\n                 // It's possible a tag update arrives before its chunk is loaded/created\n                 // We'll create a placeholder chunk entry just for the tag.\n                 // Paint data will be added when the chunk paint subscription fires.\n                newChunks[chunkId] = { paint: {}, tags: [] };\n                 console.log(`Created placeholder chunk ${chunkId} for tag ${tag.id}`);\n            }\n            // Ensure the tags array exists\n            if (!newChunks[chunkId].tags) {\n                 newChunks[chunkId].tags = [];\n            }\n            newChunks[chunkId].tags.push(tag);\n        });\n        // console.log(\"Chunks state updated with tags:\", newChunks);\n        return newChunks;\n    });\n  }, []); // No dependencies needed\n\n\n  const handleChunkPaintUpdate = useCallback((chunkId, paintSplats) => {\n    // console.log(`Paint update for chunk ${chunkId}:`, paintSplats.length, \"splats\");\n    setChunks(prev => {\n        const currentChunkData = prev[chunkId] || { tags: [] }; // Preserve tags if they exist\n        return {\n            ...prev,\n            [chunkId]: {\n                ...currentChunkData, // Keep existing tags\n                paint: paintSplats.reduce((acc, splat) => {\n                    acc[splat.id] = splat;\n                    return acc;\n                }, {})\n            }\n        };\n    });\n  }, []); // No dependencies\n\n    // --- Movement and Interaction ---\n\n   const centerStageOnPlayer = useCallback((playerX, playerY) => {\n        if(stageRef.current) {\n           const container = stageRef.current.container();\n           // Prevent centering if container dimensions aren't available yet\n           if(container.offsetWidth > 0 && container.offsetHeight > 0) {\n               setStagePos({\n                   x: -playerX + container.offsetWidth / 2,\n                   y: -playerY + container.offsetHeight / 2,\n               });\n           }\n        }\n   }, []); // No dependencies needed\n\n\n   // Handle player movement and related updates (special ability check, chunk loading)\n    useEffect(() => {\n        const moveInterval = setInterval(() => {\n            let dx = 0;\n            let dy = 0;\n            if (keysPressed['w'] || keysPressed['ArrowUp']) dy -= PLAYER_SPEED;\n            if (keysPressed['s'] || keysPressed['ArrowDown']) dy += PLAYER_SPEED;\n            if (keysPressed['a'] || keysPressed['ArrowLeft']) dx -= PLAYER_SPEED;\n            if (keysPressed['d'] || keysPressed['ArrowRight']) dx += PLAYER_SPEED;\n\n            if (dx !== 0 || dy !== 0) {\n                setSelfState(prev => {\n                    const newX = prev.x + dx;\n                    const newY = prev.y + dy;\n\n                    // Check for standing on own tags\n                    const currentActiveTags = new Set();\n                    let isOnOwnTag = false;\n                    Object.values(chunks).forEach(chunk => {\n                        (chunk.tags || []).forEach(tag => {\n                            if (tag.username === selfUsername.current && Math.hypot(newX - tag.x, newY - tag.y) < TAG_SIZE / 2) {\n                                isOnOwnTag = true;\n                                currentActiveTags.add(tag.id);\n                            }\n                        });\n                    });\n                    setActivePlayerTags(currentActiveTags); // Update which tags are being stood on\n\n                    let specialAbilityActive = prev.specialAbilityActive;\n                    let specialAbilityTimeout = prev.specialAbilityTimeout;\n                    let presenceUpdateNeeded = false; // Track if presence needs update\n\n                    if (isOnOwnTag && !prev.specialAbilityActive) {\n                        // Activate ability\n                        console.log(\"Activating special ability!\");\n                        specialAbilityActive = true;\n                        presenceUpdateNeeded = true;\n                        // Clear any existing timeout and set a new one\n                        if (prev.specialAbilityTimeout) clearTimeout(prev.specialAbilityTimeout);\n                        specialAbilityTimeout = setTimeout(() => {\n                            console.log(\"Special ability timeout reached.\");\n                            // Check if still on a tag when timeout ends\n                            let stillOnTag = false;\n                             Object.values(chunks).forEach(chunk => {\n                                (chunk.tags || []).forEach(tag => {\n                                    if (tag.username === selfUsername.current && activePlayerTags.has(tag.id)) {\n                                         stillOnTag = true;\n                                    }\n                                });\n                             });\n\n                            if (!stillOnTag) { // Only deactivate if not on a tag anymore\n                                 console.log(\"Deactivating special ability (timeout).\");\n                                 setSelfState(s => ({...s, specialAbilityActive: false, specialAbilityTimeout: null}));\n                                 if (selfId.current) room.updatePresence({ specialAbilityActive: false });\n                            } else {\n                                // If still on tag, reset the timeout? Or let it run out naturally when moving off?\n                                // Current logic: Timeout only deactivates if OFF the tag when it fires.\n                                // Resetting timeout here would keep it active indefinitely while on tag.\n                                 console.log(\"Still on tag, timeout ignored for now.\");\n                                 // We might still need to clear the timeout handle itself\n                                 setSelfState(s => ({...s, specialAbilityTimeout: null }));\n                            }\n\n                        }, SPECIAL_ABILITY_DURATION);\n\n                    } else if (!isOnOwnTag && prev.specialAbilityActive) {\n                         // Deactivate ability because moved off tag\n                         console.log(\"Deactivating special ability (moved off tag).\");\n                         specialAbilityActive = false;\n                         presenceUpdateNeeded = true;\n                         // Clear the deactivation timeout if it exists\n                         if (prev.specialAbilityTimeout) {\n                             clearTimeout(prev.specialAbilityTimeout);\n                             specialAbilityTimeout = null;\n                         }\n                    }\n\n                    // Update presence only if needed (position or ability changed)\n                    if (dx !== 0 || dy !== 0 || presenceUpdateNeeded) {\n                         const presenceUpdate = { x: newX, y: newY };\n                         if (presenceUpdateNeeded) {\n                              presenceUpdate.specialAbilityActive = specialAbilityActive;\n                         }\n                         if (selfId.current) room.updatePresence(presenceUpdate);\n                    }\n\n                    // Trigger chunk loading if necessary\n                    loadChunksAround(newX, newY);\n\n                    // Center stage on player\n                    centerStageOnPlayer(newX, newY);\n\n                    return { ...prev, x: newX, y: newY, specialAbilityActive, specialAbilityTimeout };\n                });\n            }\n             // No movement, but check if special ability timeout should fire (rare edge case)\n             else if (selfState.specialAbilityActive && selfState.specialAbilityTimeout) {\n                  // This scenario is mostly handled by the timeout callback itself.\n                  // If the timeout fires and the player hasn't moved, the callback checks if still on tag.\n             }\n\n        }, 16); // ~60 FPS\n\n        return () => clearInterval(moveInterval);\n    }, [keysPressed, chunks, selfState.specialAbilityActive, selfState.specialAbilityTimeout, selfUsername.current, activePlayerTags, loadChunksAround, centerStageOnPlayer]); // Dependencies\n\n\n   // Keyboard event listeners\n   useEffect(() => {\n     const handleKeyDown = (e) => {\n         // Ignore keyboard events if typing in the tag input\n         if (document.activeElement?.closest('.tag-input')) return;\n\n        if (e.key === 't' && !isPlacingTag && !isGeneratingTag && selfState.score >= TAG_COST) {\n             setIsPlacingTag(true);\n        } else if (e.key === 'Escape') {\n             if (isPlacingTag) {\n                setIsPlacingTag(false);\n                setTagPrompt('');\n             }\n             // Could add other Escape key functionality here if needed\n        } else if (!isPlacingTag && !isGeneratingTag) { // Only handle movement/paint if not in tag UI\n             if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(e.key.toLowerCase())) {\n                setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: true }));\n             }\n             // Handle painting on spacebar press\n             if (e.key === ' ') {\n                 handlePaint();\n             }\n        }\n     };\n     const handleKeyUp = (e) => {\n         if (!isPlacingTag && !isGeneratingTag) {\n             if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(e.key.toLowerCase())) {\n                setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: false }));\n             }\n         }\n     };\n\n     window.addEventListener('keydown', handleKeyDown);\n     window.addEventListener('keyup', handleKeyUp);\n\n     return () => {\n       window.removeEventListener('keydown', handleKeyDown);\n       window.removeEventListener('keyup', handleKeyUp);\n     };\n     // Re-run if state related to tag placement/generation changes, or score for enabling tag button\n   }, [isPlacingTag, isGeneratingTag, selfState.score, handlePaint]);\n\n\n   // Mouse click/drag painting\n   useEffect(() => {\n       const stage = stageRef.current;\n       if (!stage) return;\n\n       let isPainting = false;\n\n       const handleStageMouseDown = (e) => {\n           // Check if the click target is the stage itself or an existing shape (player, etc.)\n           // We only want to start painting if clicking on the \"background\" (stage)\n           if (e.target === stage && !isPlacingTag && !isGeneratingTag) {\n               isPainting = true;\n               handlePaint(); // Paint on initial click\n           }\n       };\n\n       const handleStageMouseMove = (e) => {\n           if (isPainting && !isPlacingTag && !isGeneratingTag) {\n               // Need to get pointer position relative to the stage, considering stage offset\n               handlePaint(); // Paint continuously while dragging\n           }\n       };\n\n       const handleStageMouseUpOrLeave = () => {\n           isPainting = false;\n       };\n\n       stage.on('mousedown', handleStageMouseDown);\n       stage.on('mousemove', handleStageMouseMove);\n       stage.on('mouseup', handleStageMouseUpOrLeave);\n       stage.on('mouseleave', handleStageMouseUpOrLeave); // Stop painting if mouse leaves canvas\n\n       return () => {\n           stage.off('mousedown', handleStageMouseDown);\n           stage.off('mousemove', handleStageMouseMove);\n           stage.off('mouseup', handleStageMouseUpOrLeave);\n           stage.off('mouseleave', handleStageMouseUpOrLeave);\n       };\n   }, [handlePaint, isPlacingTag, isGeneratingTag]); // Re-attach if handlePaint or tagging state changes\n\n\n    // --- Chunk Management ---\n\n    const loadChunksAround = useCallback((worldX, worldY) => {\n        if (!selfId.current) return; // Don't load if not initialized\n\n        const currentChunkId = getChunkId(worldX, worldY);\n        const { x: currentChunkX, y: currentChunkY } = getChunkCoords(currentChunkId);\n        const neededChunks = new Set();\n        const currentLoaded = new Set(loadedChunkIds); // Snapshot of currently loaded chunks\n        const subs = { ...chunkSubscriptions }; // Copy current subscriptions\n\n        // Determine 3x3 grid of chunks needed around the player\n        for (let dx = -1; dx <= 1; dx++) {\n            for (let dy = -1; dy <= 1; dy++) {\n                const chunkId = `${currentChunkX + dx}_${currentChunkY + dy}`;\n                neededChunks.add(chunkId);\n            }\n        }\n\n        // Load and subscribe to new chunks\n        neededChunks.forEach(chunkId => {\n            if (!currentLoaded.has(chunkId)) {\n                // console.log(\"Loading chunk:\", chunkId);\n                const collectionName = getChunkCollectionName(chunkId);\n                const unsubscribe = room.collection(collectionName).subscribe(\n                     (paintSplats) => handleChunkPaintUpdate(chunkId, paintSplats) // Pass chunkId to handler\n                );\n                subs[chunkId] = unsubscribe; // Store the unsubscribe function\n\n                // Immediately fetch existing tags for this chunk (tag subscription handles future updates)\n                 const chunkTags = room.collection(TAG_COLLECTION).filter({ chunkId }).getList();\n                 setChunks(prev => ({\n                     ...prev,\n                     [chunkId]: {\n                         paint: prev[chunkId]?.paint || {}, // Keep existing paint if any (e.g., from placeholder)\n                         tags: chunkTags || [] // Initialize with fetched tags\n                     }\n                 }));\n\n                setLoadedChunkIds(prev => new Set(prev).add(chunkId));\n            }\n        });\n\n        // Unsubscribe from chunks that are no longer needed\n        currentLoaded.forEach(chunkId => {\n            if (!neededChunks.has(chunkId)) {\n                 // console.log(\"Unloading chunk:\", chunkId);\n                 subs[chunkId]?.(); // Call the unsubscribe function\n                 delete subs[chunkId]; // Remove from subscriptions object\n                 setLoadedChunkIds(prev => {\n                     const newSet = new Set(prev);\n                     newSet.delete(chunkId);\n                     return newSet;\n                 });\n                 // Optional: Remove chunk data from state to save memory,\n                 // but be careful if scoring relies on briefly unloaded chunks\n                  setChunks(prev => {\n                      const newChunks = { ...prev };\n                      delete newChunks[chunkId];\n                      return newChunks;\n                  });\n            }\n        });\n\n        // Update the state with the new set of subscriptions\n        setChunkSubscriptions(subs);\n\n    }, [loadedChunkIds, chunkSubscriptions, handleChunkPaintUpdate]); // Dependencies\n\n    // --- Painting and Tagging Actions ---\n\n    const handlePaint = useCallback(() => {\n        if (!selfId.current || isPlacingTag || isGeneratingTag) return; // Don't paint if tagging\n\n        const now = Date.now();\n        if (now - lastPaintTime < PAINT_COOLDOWN) return; // Throttle painting\n\n        const { x, y, color, brush, specialAbilityActive } = selfState;\n        const chunkId = getChunkId(x, y);\n        const collectionName = getChunkCollectionName(chunkId);\n        let radius = PAINT_RADIUS[brush];\n\n        // Apply special ability effect\n         if (specialAbilityActive) {\n             radius *= SPECIAL_ABILITY_RADIUS_MULTIPLIER;\n         }\n\n        // Use world coordinates directly for the splat\n        const splatData = {\n            x: x,\n            y: y,\n            color: color,\n            radius: radius,\n            username: selfUsername.current, // Store username with splat\n            timestamp: now,\n        };\n\n        // Optimistic UI update (optional but makes painting feel smoother)\n        // This adds the splat visually before confirmation from the database\n        /*\n        const optimisticId = `optimistic_${Date.now()}`;\n        setChunks(prev => {\n             const newChunks = {...prev};\n             if (!newChunks[chunkId]) newChunks[chunkId] = { paint: {}, tags: [] };\n             if (!newChunks[chunkId].paint) newChunks[chunkId].paint = {};\n             newChunks[chunkId].paint[optimisticId] = {...splatData, id: optimisticId};\n             return newChunks;\n        });\n        */\n\n        // Create paint splat record in the database\n        room.collection(collectionName).create(splatData)\n            .then(() => {\n                 // Optional: Remove optimistic update now that real data will arrive via subscription\n                 /*\n                 setChunks(prev => {\n                      const newChunks = {...prev};\n                      if(newChunks[chunkId]?.paint?.[optimisticId]) {\n                           delete newChunks[chunkId].paint[optimisticId];\n                           // Check if paint object is empty and remove if necessary?\n                      }\n                      return newChunks;\n                 });\n                 */\n            })\n            .catch(error => {\n                 console.error(\"Error creating paint splat:\", error);\n                 // Optional: Remove optimistic update on error\n                  /*\n                 setChunks(prev => {\n                      const newChunks = {...prev};\n                      if(newChunks[chunkId]?.paint?.[optimisticId]) {\n                           delete newChunks[chunkId].paint[optimisticId];\n                      }\n                      return newChunks;\n                 });\n                  */\n            });\n\n        setLastPaintTime(now);\n\n    }, [lastPaintTime, selfState, selfId.current, selfUsername.current, isPlacingTag, isGeneratingTag]);\n\n\n    const handlePlaceTag = useCallback(async () => {\n         if (!tagPrompt || isGeneratingTag || selfState.score < TAG_COST || !selfId.current) return;\n\n         setIsGeneratingTag(true);\n         setIsPlacingTag(false); // Close input UI\n\n         try {\n             console.log(\"Generating tag image for prompt:\", tagPrompt);\n             const imageResult = await websim.imageGen({\n                 prompt: `Pixel art sprite style: ${tagPrompt}`, // Modify prompt slightly\n                 aspect_ratio: \"1:1\",\n                 width: TAG_SIZE * 2, // Generate slightly higher res if possible\n                 height: TAG_SIZE * 2,\n             });\n\n             if (!imageResult || !imageResult.url) {\n                 throw new Error(\"Image generation failed or returned no URL.\");\n             }\n             console.log(\"Tag image generated:\", imageResult.url);\n\n             const { x, y } = selfState; // Tag at player's current position\n             const chunkId = getChunkId(x, y); // Associate tag with its chunk\n\n             // Deduct score - update locally first\n             const newScore = selfState.score - TAG_COST;\n             setSelfState(prev => ({ ...prev, score: newScore }));\n             room.updatePresence({ score: newScore }); // Update presence immediately\n\n             // Create tag record\n             await room.collection(TAG_COLLECTION).create({\n                 x: x,\n                 y: y,\n                 chunkId: chunkId, // Store chunkId for potential filtering, though x,y is primary\n                 prompt: tagPrompt,\n                 imageUrl: imageResult.url,\n                 username: selfUsername.current,\n                 timestamp: Date.now(),\n             });\n\n             console.log(\"Tag placed successfully at\", x, y);\n\n         } catch (error) {\n             console.error(\"Error placing tag:\", error);\n             // Add user feedback here (e.g., display an error message)\n             // Revert score deduction if tag creation failed? (Tricky, network issues)\n             // For simplicity, we don't revert score here. Score recalc will fix eventually.\n         } finally {\n             setIsGeneratingTag(false);\n             setTagPrompt(''); // Clear prompt\n         }\n     }, [tagPrompt, isGeneratingTag, selfState, selfId.current, selfUsername.current]);\n\n\n    // --- Score Calculation ---\n\n    useEffect(() => {\n        const calculateScores = () => {\n            if (!selfId.current) return; // Don't calculate score if not initialized\n\n            const newScores = {};\n            const activeUsernames = new Set(Object.values(players).map(p => p.username).filter(Boolean));\n            if (selfUsername.current) {\n                activeUsernames.add(selfUsername.current);\n            }\n\n            // Initialize scores to 0\n            activeUsernames.forEach(username => newScores[username] = 0);\n\n            // --- Accurate Scoring using hidden canvas ---\n             const scoringCanvases = {}; // { chunkId: { canvas, ctx } }\n\n             const getScoringContext = (chunkId) => {\n                 if (!scoringCanvases[chunkId]) {\n                     const canvas = document.createElement('canvas');\n                     canvas.width = CHUNK_SIZE;\n                     canvas.height = CHUNK_SIZE;\n                     const ctx = canvas.getContext('2d', { willReadFrequently: true });\n                     if (!ctx) {\n                         console.error(\"Failed to get 2D context for scoring.\");\n                         return null;\n                     }\n                     scoringCanvases[chunkId] = { canvas, ctx };\n                 }\n                  // Clear canvas for this chunk before drawing\n                  scoringCanvases[chunkId].ctx.clearRect(0, 0, CHUNK_SIZE, CHUNK_SIZE);\n                 return scoringCanvases[chunkId].ctx;\n             };\n\n             // 1. Draw all paint splats onto their respective chunk canvases (newest last)\n             Object.entries(chunks).forEach(([chunkId, chunkData]) => {\n                 if (chunkData?.paint) {\n                     const ctx = getScoringContext(chunkId);\n                     if (!ctx) return;\n\n                     const sortedSplats = Object.values(chunkData.paint).sort((a, b) => a.timestamp - b.timestamp);\n                     const { x: chunkOriginX, y: chunkOriginY } = getChunkCoords(chunkId);\n\n                     sortedSplats.forEach(splat => {\n                          // Store username in fillStyle (temporary hack - needs robust mapping)\n                          // A better way: Assign each user a unique solid color for scoring.\n                          // For now, use splat color. Overwrites are handled by drawing order.\n                         ctx.fillStyle = splat.color;\n                         ctx.beginPath();\n                         // Draw relative to chunk origin\n                         ctx.arc(splat.x - chunkOriginX * CHUNK_SIZE, splat.y - chunkOriginY * CHUNK_SIZE, splat.radius, 0, Math.PI * 2);\n                         ctx.fill();\n                     });\n                 }\n             });\n\n             // 2. Sample pixels on each chunk canvas to calculate score\n             const SAMPLE_STEP = 5; // Sample every 5th pixel (adjust for performance/accuracy)\n             Object.entries(scoringCanvases).forEach(([chunkId, { ctx }]) => {\n                 if (!ctx) return;\n                 const imageData = ctx.getImageData(0, 0, CHUNK_SIZE, CHUNK_SIZE);\n                 const data = imageData.data;\n                 const pixelScores = {}; // Map color hex to score for this chunk\n\n                 for (let y = 0; y < CHUNK_SIZE; y += SAMPLE_STEP) {\n                     for (let x = 0; x < CHUNK_SIZE; x += SAMPLE_STEP) {\n                         const index = (y * CHUNK_SIZE + x) * 4;\n                         const r = data[index];\n                         const g = data[index + 1];\n                         const b = data[index + 2];\n                         const a = data[index + 3];\n\n                         // Check if pixel is painted (alpha > threshold)\n                         if (a > 128) {\n                             const hexColor = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`.toUpperCase();\n                             pixelScores[hexColor] = (pixelScores[hexColor] || 0) + (SAMPLE_STEP * SAMPLE_STEP); // Area represented by sample\n                         }\n                     }\n                 }\n\n                 // 3. Map colors back to usernames and add to total scores\n                 // This requires knowing which player uses which color.\n                 // We'll iterate through current players AND historical splats if needed.\n                 const colorToUser = {};\n                 Object.values(players).forEach(p => { if(p.color) colorToUser[p.color.toUpperCase()] = p.username; });\n                 // Add self player info\n                 if(selfState.color && selfUsername.current) colorToUser[selfState.color.toUpperCase()] = selfUsername.current;\n                 // Iterate through splats for historical colors (if players disconnected/changed color)\n                 Object.values(chunks).forEach(cData => Object.values(cData.paint || {}).forEach(splat => {\n                     if(splat.color && splat.username && !colorToUser[splat.color.toUpperCase()]) {\n                         colorToUser[splat.color.toUpperCase()] = splat.username;\n                     }\n                 }));\n\n\n                 Object.entries(pixelScores).forEach(([hexColor, area]) => {\n                     const username = colorToUser[hexColor];\n                     if (username && newScores[username] !== undefined) {\n                         newScores[username] += area;\n                     } else if (username) {\n                         // User might not be currently connected but has paint\n                         if (!newScores[username]) newScores[username] = 0;\n                         newScores[username] += area;\n                         // Add to activeUsernames if not present? For display maybe.\n                         // activeUsernames.add(username);\n                     } else {\n                         // console.warn(`Could not map color ${hexColor} back to a user.`);\n                     }\n                 });\n             });\n\n            // Calculate final scores (integer) and update state\n            const finalScores = {};\n            activeUsernames.forEach(username => {\n                finalScores[username] = Math.floor(newScores[username] || 0);\n            });\n\n            setScores(finalScores);\n\n            // Update self score locally and in presence if changed\n            const newSelfScore = finalScores[selfUsername.current] || 0;\n            if (newSelfScore !== selfState.score) {\n                 setSelfState(prev => ({ ...prev, score: newSelfScore }));\n                 // Only update presence if the score actually changed significantly to avoid flooding\n                 if (Math.abs(newSelfScore - (players[selfId.current]?.score || 0)) > 10) {\n                    room.updatePresence({ score: newSelfScore });\n                 }\n            }\n        };\n\n        const scoreInterval = setInterval(calculateScores, SCORE_UPDATE_INTERVAL);\n        return () => clearInterval(scoreInterval);\n\n    }, [chunks, players, selfState.color, selfState.score, selfId.current, selfUsername.current]); // Dependencies\n\n\n    // --- Rendering ---\n\n    // Prepare sorted scores for display\n    const sortedScores = useMemo(() => {\n        return Object.entries(scores)\n            .map(([username, score]) => {\n                // Find the player's avatar URL from peers or cached avatars\n                const playerEntry = Object.values(players).find(p => p.username === username);\n                const clientId = playerEntry?.id || (username === selfUsername.current ? selfId.current : null);\n                const avatarUrl = clientId ? room.peers[clientId]?.avatarUrl : null; // Get current URL from peers\n                return { username, score, avatarUrl };\n            })\n            .filter(s => s.score > 0 || s.username === selfUsername.current) // Show players with score > 0 or self\n            .sort((a, b) => b.score - a.score); // Sort descending\n    }, [scores, players, selfId.current, selfUsername.current, room.peers]);\n\n\n    // Get self player data merged from presence and local state\n    const selfPlayerData = useMemo(() => {\n        // Combine data from players state (synced presence) and local selfState\n        const baseData = players[selfId.current] || {}; // Start with synced data if available\n        return {\n             ...baseData, // Synced data (like score from others)\n             ...selfState, // Local state (position, color, brush, ability - potentially more up-to-date)\n             username: selfUsername.current, // Ensure username is set\n             // avatarImage: playerAvatars[selfId.current], // Get loaded image\n        };\n    }, [players, selfState, selfId.current, selfUsername.current]); // playerAvatars not needed here, passed separately\n\n\n  // Render Loading state or the main App\n  if (!isInitialized.current || !selfId.current) {\n      return <div>Loading...</div>;\n  }\n\n  return (\n    <div>\n       {/* --- UI Controls --- */}\n       <div className=\"controls\">\n           <label htmlFor=\"color\">Color:</label>\n           <input\n               type=\"color\"\n               id=\"color\"\n               value={selfState.color}\n               onChange={(e) => {\n                   const newColor = e.target.value;\n                   setSelfState(prev => ({ ...prev, color: newColor }));\n                   room.updatePresence({ color: newColor });\n               }}\n           />\n           <label htmlFor=\"brush\">Brush:</label>\n           <select\n                id=\"brush\"\n                value={selfState.brush}\n                onChange={(e) => {\n                     const newBrush = e.target.value;\n                     setSelfState(prev => ({ ...prev, brush: newBrush }));\n                     room.updatePresence({ brush: newBrush });\n                 }}\n           >\n                <option value=\"small\">Small</option>\n                <option value=\"medium\">Medium</option>\n                <option value=\"large\">Large</option>\n           </select>\n            <span>Score: {selfState.score}</span>\n            <button onClick={() => setIsPlacingTag(true)} disabled={selfState.score < TAG_COST || isPlacingTag || isGeneratingTag}>\n                 Place Tag ({isGeneratingTag ? '...' : `-${TAG_COST}`})\n            </button>\n            {selfState.specialAbilityActive && <span style={{color: 'gold', fontWeight: 'bold', marginLeft:'5px'}}>⚡ ACTIVE!</span>}\n       </div>\n\n        {/* --- Score Board --- */}\n        <div className=\"score-board\">\n             <h3>Scores</h3>\n             {sortedScores.map(({ username, score, avatarUrl }) => (\n                 <div key={username}>\n                     <img src={avatarUrl || `https://images.websim.ai/avatar/${username}?fallback=false`} // Use websim avatar URL directly\n                          alt={username}\n                          onError={(e) => { e.target.src = 'https://images.websim.ai/default-avatar.png'; }} // Fallback on error\n                     />\n                     <span>{username}</span>\n                     <span>{score}</span>\n                 </div>\n             ))}\n         </div>\n\n        {/* --- Tag Input --- */}\n       {isPlacingTag && (\n          <div className=\"tag-input\">\n              <input\n                  type=\"text\"\n                  placeholder=\"Enter tag prompt (e.g., 'a happy cat wizard')\"\n                  value={tagPrompt}\n                  onChange={(e) => setTagPrompt(e.target.value)}\n                  onKeyDown={(e) => { if (e.key === 'Enter') handlePlaceTag(); }} // Allow Enter to submit\n                  autoFocus\n              />\n              <button onClick={handlePlaceTag} disabled={!tagPrompt || isGeneratingTag}>\n                 {isGeneratingTag ? 'Generating...' : 'Create Tag'}\n              </button>\n              <button onClick={() => { setIsPlacingTag(false); setTagPrompt(''); }} className=\"cancel-button\">Cancel</button>\n          </div>\n       )}\n\n      {/* --- Game Canvas --- */}\n      <Stage\n        width={window.innerWidth}\n        height={window.innerHeight}\n        x={stagePos.x}\n        y={stagePos.y}\n        ref={stageRef}\n        // Prevent context menu on right-click within the stage\n        onContextMenu={(e) => e.evt.preventDefault()}\n      >\n        <Layer ref={layerRef} imageSmoothingEnabled={false}> {/* Disable smoothing for sharper pixels potentially */}\n          {/* Render Chunks */}\n          {Array.from(loadedChunkIds).map(chunkId => {\n              const chunkData = chunks[chunkId];\n              if (!chunkData) return null; // Don't render if chunk data isn't loaded yet\n              return (\n                  <Chunk\n                    key={chunkId}\n                    chunkId={chunkId}\n                    paintData={chunkData.paint || {}}\n                    tags={chunkData.tags || []}\n                    activePlayerTags={activePlayerTags} // Pass down the set of active tags\n                  />\n              );\n          })}\n\n           {/* Render Other Players */}\n           {Object.entries(players).map(([id, player]) => {\n               if (id === selfId.current) return null; // Don't render self here\n               if (player && typeof player.x === 'number' && typeof player.y === 'number') {\n                   return <Player\n                                key={id}\n                                player={player}\n                                isSelf={false}\n                                color={player.color || '#888888'}\n                                username={player.username}\n                                avatarImage={playerAvatars[id]} // Pass loaded avatar image\n                           />;\n               }\n               return null;\n           })}\n\n           {/* Render Self Player */}\n           <Player\n                player={selfPlayerData}\n                isSelf={true}\n                color={selfPlayerData.color}\n                username={selfPlayerData.username}\n                avatarImage={playerAvatars[selfId.current]} // Pass loaded avatar image\n           />\n\n        </Layer>\n      </Stage>\n    </div>\n  );\n}\n\nconst container = document.getElementById('root');\nconst root = createRoot(container);\nroot.render(<App />);\n\n"}
+import { Fragment, jsxDEV } from "react/jsx-dev-runtime";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createRoot } from "react-dom/client";
+import { Stage, Layer, Rect, Circle, Image as KonvaImage, Text } from "react-konva";
+import Konva from "konva";
+import config from "./config.js";
+const room = new WebsimSocket();
+const {
+  CHUNK_SIZE,
+  PLAYER_SPEED,
+  PAINT_RADIUS,
+  PAINT_COOLDOWN,
+  TAG_COST,
+  TAG_SIZE,
+  SCORE_UPDATE_INTERVAL,
+  SPECIAL_ABILITY_DURATION,
+  SPECIAL_ABILITY_RADIUS_MULTIPLIER
+} = config;
+const CHUNK_COLLECTION_PREFIX = "chunk_paint_v2_";
+const TAG_COLLECTION = "tag_v2";
+const getChunkId = (x, y) => {
+  const chunkX = Math.floor(x / CHUNK_SIZE);
+  const chunkY = Math.floor(y / CHUNK_SIZE);
+  return `${chunkX}_${chunkY}`;
+};
+const getChunkCoords = (chunkId) => {
+  const [x, y] = chunkId.split("_").map(Number);
+  return { x, y };
+};
+const getChunkCollectionName = (chunkId) => `${CHUNK_COLLECTION_PREFIX}${chunkId}`;
+const Player = React.memo(({ player, isSelf, color, username, avatarImage }) => {
+  if (!player || typeof player.x !== "number" || typeof player.y !== "number") {
+    return null;
+  }
+  const radius = 15;
+  return /* @__PURE__ */ jsxDEV(Fragment, { children: [
+    /* @__PURE__ */ jsxDEV(
+      Circle,
+      {
+        x: player.x,
+        y: player.y,
+        radius,
+        fill: color,
+        stroke: player.specialAbilityActive ? "gold" : "black",
+        strokeWidth: player.specialAbilityActive ? 3 : 1.5,
+        shadowBlur: player.specialAbilityActive ? 8 : 0,
+        shadowColor: player.specialAbilityActive ? "gold" : void 0,
+        shadowOpacity: 0.9,
+        listening: false
+      },
+      void 0,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 44,
+        columnNumber: 7
+      }
+    ),
+    avatarImage && /* @__PURE__ */ jsxDEV(
+      KonvaImage,
+      {
+        image: avatarImage,
+        x: player.x - radius * 0.7,
+        y: player.y - radius * 0.7,
+        width: radius * 1.4,
+        height: radius * 1.4,
+        cornerRadius: radius * 0.7,
+        listening: false
+      },
+      void 0,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 57,
+        columnNumber: 13
+      }
+    ),
+    /* @__PURE__ */ jsxDEV(
+      Text,
+      {
+        text: username || "...",
+        x: player.x,
+        y: player.y - radius - 14,
+        fontSize: 12,
+        fill: "#333",
+        align: "center",
+        width: 100,
+        offsetX: 50,
+        listening: false
+      },
+      void 0,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 68,
+        columnNumber: 8
+      }
+    )
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 43,
+    columnNumber: 5
+  });
+});
+const PaintSplat = React.memo(({ splat }) => /* @__PURE__ */ jsxDEV(
+  Circle,
+  {
+    x: splat.x,
+    y: splat.y,
+    radius: splat.radius,
+    fill: splat.color,
+    opacity: 0.75,
+    listening: false
+  },
+  void 0,
+  false,
+  {
+    fileName: "<stdin>",
+    lineNumber: 84,
+    columnNumber: 3
+  }
+));
+const Tag = React.memo(({ tag, isAbilitySource }) => {
+  const [image, setImage] = useState(null);
+  const [status, setStatus] = useState("loading");
+  useEffect(() => {
+    if (tag?.imageUrl && tag.imageUrl !== image?.src) {
+      setStatus("loading");
+      const img = new window.Image();
+      img.crossOrigin = "Anonymous";
+      img.src = tag.imageUrl;
+      img.onload = () => {
+        setImage(img);
+        setStatus("loaded");
+      };
+      img.onerror = () => {
+        console.error("Failed to load tag image:", tag.imageUrl);
+        setStatus("error");
+      };
+    } else if (!tag?.imageUrl) {
+      setStatus("error");
+    }
+  }, [tag?.imageUrl, image?.src]);
+  const borderStroke = isAbilitySource ? "gold" : "black";
+  const borderStrokeWidth = isAbilitySource ? 4 : 1;
+  const shadow = isAbilitySource ? 10 : 0;
+  if (!tag || typeof tag.x !== "number" || typeof tag.y !== "number") {
+    return null;
+  }
+  const commonProps = {
+    x: tag.x - TAG_SIZE / 2,
+    y: tag.y - TAG_SIZE / 2,
+    width: TAG_SIZE,
+    height: TAG_SIZE,
+    stroke: borderStroke,
+    strokeWidth: borderStrokeWidth,
+    shadowBlur: shadow,
+    shadowColor: "gold",
+    shadowOpacity: 0.8,
+    listening: false
+    // Tags generally don't need events
+  };
+  if (status === "loading" || status === "error" || !image) {
+    return /* @__PURE__ */ jsxDEV(Rect, { ...commonProps, fill: "#ddd" }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 142,
+      columnNumber: 14
+    });
+  }
+  return /* @__PURE__ */ jsxDEV(
+    KonvaImage,
+    {
+      image,
+      ...commonProps
+    },
+    void 0,
+    false,
+    {
+      fileName: "<stdin>",
+      lineNumber: 146,
+      columnNumber: 5
+    }
+  );
+});
+const Chunk = React.memo(({ chunkId, paintData, tags, activePlayerTags }) => {
+  if (!chunkId || typeof chunkId !== "string" || !chunkId.includes("_")) {
+    console.warn("Invalid chunkId passed to Chunk component:", chunkId);
+    return null;
+  }
+  const chunkCoords = useMemo(() => getChunkCoords(chunkId), [chunkId]);
+  if (!chunkCoords) return null;
+  const { x: chunkX, y: chunkY } = chunkCoords;
+  const chunkPixelX = chunkX * CHUNK_SIZE;
+  const chunkPixelY = chunkY * CHUNK_SIZE;
+  const paintSplats = useMemo(() => {
+    return Object.values(paintData || {}).filter((splat) => splat && typeof splat.x === "number" && typeof splat.y === "number" && splat.id).map((splat) => /* @__PURE__ */ jsxDEV(PaintSplat, { splat }, splat.id, false, {
+      fileName: "<stdin>",
+      lineNumber: 175,
+      columnNumber: 15
+    }));
+  }, [paintData]);
+  const chunkTags = useMemo(() => {
+    return (tags || []).filter((tag) => tag && typeof tag.x === "number" && typeof tag.y === "number" && tag.id).map((tag) => /* @__PURE__ */ jsxDEV(
+      Tag,
+      {
+        tag,
+        isAbilitySource: activePlayerTags.has(tag.id)
+      },
+      tag.id,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 186,
+        columnNumber: 15
+      }
+    ));
+  }, [tags, activePlayerTags]);
+  return /* @__PURE__ */ jsxDEV(Fragment, { children: [
+    paintSplats,
+    chunkTags
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 196,
+    columnNumber: 5
+  });
+});
+function App() {
+  const [players, setPlayers] = useState({});
+  const [selfState, setSelfState] = useState({ x: window.innerWidth / 2, y: window.innerHeight / 2, color: "#FF0000", brush: "medium", score: 0, specialAbilityActive: false, specialAbilityTimeout: null });
+  const [chunks, setChunks] = useState({});
+  const [loadedChunkIds, setLoadedChunkIds] = useState(/* @__PURE__ */ new Set());
+  const [chunkSubscriptions, setChunkSubscriptions] = useState({});
+  const [tagSubscription, setTagSubscription] = useState(null);
+  const [presenceSubscription, setPresenceSubscription] = useState(null);
+  const [keysPressed, setKeysPressed] = useState({});
+  const [lastPaintTime, setLastPaintTime] = useState(0);
+  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+  const [isPlacingTag, setIsPlacingTag] = useState(false);
+  const [tagPrompt, setTagPrompt] = useState("");
+  const [isGeneratingTag, setIsGeneratingTag] = useState(false);
+  const [scores, setScores] = useState({});
+  const [playerAvatars, setPlayerAvatars] = useState({});
+  const [activePlayerTags, setActivePlayerTags] = useState(/* @__PURE__ */ new Set());
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const stageRef = useRef(null);
+  const layerRef = useRef(null);
+  const selfId = useRef(null);
+  const selfUsername = useRef(null);
+  useEffect(() => {
+    if (!isLoading || error) return;
+    let isMounted = true;
+    const initialize = async () => {
+      try {
+        console.log("Initializing Websim connection...");
+        await room.initialize();
+        if (!isMounted) return;
+        selfId.current = room.clientId;
+        selfUsername.current = room.peers[selfId.current]?.username || "Player";
+        console.log("Initialization complete. Self ID:", selfId.current, "Username:", selfUsername.current);
+        if (!room.peers || !room.peers[selfId.current]) {
+          throw new Error("Failed to get peer information after initialization.");
+        }
+        const initialAvatar = await loadAvatar(room.peers[selfId.current]?.avatarUrl);
+        if (isMounted) {
+          setPlayerAvatars((prev) => ({ ...prev, [selfId.current]: initialAvatar }));
+        } else return;
+        const initialPresence = {
+          x: selfState.x,
+          y: selfState.y,
+          color: selfState.color,
+          brush: selfState.brush,
+          score: selfState.score,
+          specialAbilityActive: selfState.specialAbilityActive
+        };
+        room.updatePresence(initialPresence);
+        console.log("Initial presence sent:", initialPresence);
+        const unsubPresence = room.subscribePresence(handlePresenceUpdate);
+        if (isMounted) setPresenceSubscription(() => unsubPresence);
+        else unsubPresence();
+        const unsubTags = room.collection(TAG_COLLECTION).subscribe(handleTagUpdate);
+        if (isMounted) setTagSubscription(() => unsubTags);
+        else unsubTags();
+        if (selfId.current) {
+          loadChunksAround(selfState.x, selfState.y);
+          centerStageOnPlayer(selfState.x, selfState.y);
+        } else {
+          throw new Error("Self ID not set after initialization, cannot load chunks.");
+        }
+        if (isMounted) setIsLoading(false);
+      } catch (err) {
+        console.error("Initialization failed:", err);
+        if (isMounted) setError(err.message || "Failed to initialize. Please refresh.");
+      }
+    };
+    initialize();
+    return () => {
+      isMounted = false;
+      console.log("Cleaning up subscriptions...");
+      presenceSubscription?.();
+      tagSubscription?.();
+      Object.values(chunkSubscriptions).forEach((unsub) => unsub?.());
+      if (selfState.specialAbilityTimeout) {
+        clearTimeout(selfState.specialAbilityTimeout);
+      }
+    };
+  }, []);
+  const loadAvatar = useCallback(async (url) => {
+    if (!url) return null;
+    return new Promise((resolve) => {
+      const img = new window.Image();
+      img.crossOrigin = "Anonymous";
+      img.src = url;
+      img.onload = () => resolve(img);
+      img.onerror = () => {
+        console.warn("Failed to load avatar:", url);
+        resolve(null);
+      };
+    });
+  }, []);
+  const handlePresenceUpdate = useCallback(async (presence) => {
+    if (!room.peers) {
+      console.warn("Received presence update before room.peers was initialized.");
+      return;
+    }
+    const updatedPlayers = {};
+    const avatarLoadPromises = [];
+    const currentAvatars = { ...playerAvatars };
+    for (const [clientId, playerData] of Object.entries(presence)) {
+      const peerInfo = room.peers[clientId];
+      if (playerData && peerInfo) {
+        const username = peerInfo.username;
+        if (typeof playerData.x === "number" && typeof playerData.y === "number") {
+          updatedPlayers[clientId] = { ...playerData, username };
+        } else {
+          const existingPlayer = players[clientId];
+          if (existingPlayer && typeof existingPlayer.x === "number" && typeof existingPlayer.y === "number") {
+            updatedPlayers[clientId] = { ...existingPlayer, ...playerData, username };
+          } else {
+            console.warn(`Player ${clientId} (${username}) received invalid coordinates:`, playerData);
+            continue;
+          }
+        }
+        const avatarUrl = peerInfo.avatarUrl;
+        if (avatarUrl && (!currentAvatars[clientId] || currentAvatars[clientId]?.src !== avatarUrl)) {
+          avatarLoadPromises.push(
+            loadAvatar(avatarUrl).then((img) => {
+              setPlayerAvatars((prev) => ({ ...prev, [clientId]: img }));
+            })
+          );
+        } else if (!avatarUrl && currentAvatars[clientId]) {
+          setPlayerAvatars((prev) => {
+            const newState = { ...prev };
+            delete newState[clientId];
+            return newState;
+          });
+        }
+      } else {
+        setPlayerAvatars((prev) => {
+          const newState = { ...prev };
+          delete newState[clientId];
+          return newState;
+        });
+      }
+    }
+    await Promise.all(avatarLoadPromises);
+    setPlayers(updatedPlayers);
+  }, [playerAvatars, loadAvatar, players]);
+  const handleTagUpdate = useCallback((allTags) => {
+    setChunks((prevChunks) => {
+      const newChunks = { ...prevChunks };
+      const activeChunkIds = new Set(Object.keys(newChunks));
+      const tagMapByChunk = {};
+      allTags.forEach((tag) => {
+        if (!tag || typeof tag.x !== "number" || typeof tag.y !== "number" || !tag.id) {
+          console.warn("Received invalid tag data:", tag);
+          return;
+        }
+        const chunkId = getChunkId(tag.x, tag.y);
+        if (!tagMapByChunk[chunkId]) {
+          tagMapByChunk[chunkId] = [];
+        }
+        tagMapByChunk[chunkId].push(tag);
+        activeChunkIds.add(chunkId);
+      });
+      activeChunkIds.forEach((chunkId) => {
+        const existingChunk = newChunks[chunkId] || { paint: {}, tags: [] };
+        const newTagsForChunk = tagMapByChunk[chunkId] || [];
+        if (JSON.stringify(existingChunk.tags) !== JSON.stringify(newTagsForChunk)) {
+          newChunks[chunkId] = {
+            ...existingChunk,
+            tags: newTagsForChunk
+          };
+        } else if (!newChunks[chunkId] && newTagsForChunk.length > 0) {
+          newChunks[chunkId] = { paint: {}, tags: newTagsForChunk };
+          console.log(`Created placeholder chunk ${chunkId} for tag update.`);
+        }
+      });
+      return newChunks;
+    });
+  }, []);
+  const handleChunkPaintUpdate = useCallback((chunkId, paintSplats) => {
+    setChunks((prev) => {
+      const currentChunkData = prev[chunkId] || { tags: [] };
+      const newPaintMap = (paintSplats || []).reduce((acc, splat) => {
+        if (splat && splat.id && typeof splat.x === "number" && typeof splat.y === "number") {
+          acc[splat.id] = splat;
+        } else {
+          console.warn(`Invalid splat data received for chunk ${chunkId}:`, splat);
+        }
+        return acc;
+      }, {});
+      if (JSON.stringify(currentChunkData.paint) !== JSON.stringify(newPaintMap)) {
+        return {
+          ...prev,
+          [chunkId]: {
+            ...currentChunkData,
+            // Keep existing tags
+            paint: newPaintMap
+          }
+        };
+      } else {
+        return prev;
+      }
+    });
+  }, []);
+  const centerStageOnPlayer = useCallback((playerX, playerY) => {
+    if (stageRef.current) {
+      const container2 = stageRef.current.container();
+      if (container2 && container2.offsetWidth > 0 && container2.offsetHeight > 0) {
+        setStagePos({
+          x: -playerX + container2.offsetWidth / 2,
+          y: -playerY + container2.offsetHeight / 2
+        });
+      }
+    }
+  }, []);
+  useEffect(() => {
+    if (isLoading || error || !selfId.current) return;
+    const moveInterval = setInterval(() => {
+      let dx = 0;
+      let dy = 0;
+      if (keysPressed["w"] || keysPressed["ArrowUp"]) dy -= PLAYER_SPEED;
+      if (keysPressed["s"] || keysPressed["ArrowDown"]) dy += PLAYER_SPEED;
+      if (keysPressed["a"] || keysPressed["ArrowLeft"]) dx -= PLAYER_SPEED;
+      if (keysPressed["d"] || keysPressed["ArrowRight"]) dx += PLAYER_SPEED;
+      if (dx !== 0 || dy !== 0) {
+        setSelfState((prev) => {
+          if (typeof prev.x !== "number" || typeof prev.y !== "number") {
+            console.error("Invalid selfState coordinates before movement:", prev);
+            return { ...prev, x: window.innerWidth / 2, y: window.innerHeight / 2 };
+          }
+          const newX = prev.x + dx;
+          const newY = prev.y + dy;
+          const currentActiveTags = /* @__PURE__ */ new Set();
+          let isOnOwnTag = false;
+          Object.values(chunks).forEach((chunk) => {
+            (chunk?.tags || []).forEach((tag) => {
+              if (tag && tag.username === selfUsername.current && typeof tag.x === "number" && typeof tag.y === "number") {
+                if (Math.hypot(newX - tag.x, newY - tag.y) < TAG_SIZE / 2) {
+                  isOnOwnTag = true;
+                  currentActiveTags.add(tag.id);
+                }
+              }
+            });
+          });
+          setActivePlayerTags((prevActiveTags) => {
+            if (prevActiveTags.size !== currentActiveTags.size || ![...prevActiveTags].every((id) => currentActiveTags.has(id))) {
+              return currentActiveTags;
+            }
+            return prevActiveTags;
+          });
+          let specialAbilityActive = prev.specialAbilityActive;
+          let specialAbilityTimeout = prev.specialAbilityTimeout;
+          let presenceUpdateNeeded = false;
+          if (isOnOwnTag && !prev.specialAbilityActive) {
+            specialAbilityActive = true;
+            presenceUpdateNeeded = true;
+            if (prev.specialAbilityTimeout) clearTimeout(prev.specialAbilityTimeout);
+            specialAbilityTimeout = setTimeout(() => {
+              let stillOnTag = false;
+              const currentX = selfState.x;
+              const currentY = selfState.y;
+              Object.values(chunks).forEach((chunk) => {
+                (chunk?.tags || []).forEach((tag) => {
+                  if (tag && tag.username === selfUsername.current && typeof tag.x === "number" && typeof tag.y === "number") {
+                    if (Math.hypot(currentX - tag.x, currentY - tag.y) < TAG_SIZE / 2) {
+                      stillOnTag = true;
+                    }
+                  }
+                });
+              });
+              if (!stillOnTag) {
+                setSelfState((s) => ({ ...s, specialAbilityActive: false, specialAbilityTimeout: null }));
+                if (selfId.current) room.updatePresence({ specialAbilityActive: false });
+              } else {
+                setSelfState((s) => ({ ...s, specialAbilityTimeout: null }));
+              }
+            }, SPECIAL_ABILITY_DURATION);
+          } else if (!isOnOwnTag && prev.specialAbilityActive) {
+            specialAbilityActive = false;
+            presenceUpdateNeeded = true;
+            if (prev.specialAbilityTimeout) {
+              clearTimeout(prev.specialAbilityTimeout);
+              specialAbilityTimeout = null;
+            }
+          }
+          const presenceUpdate = { x: newX, y: newY };
+          let shouldUpdatePresence = dx !== 0 || dy !== 0;
+          if (specialAbilityActive !== prev.specialAbilityActive) {
+            presenceUpdate.specialAbilityActive = specialAbilityActive;
+            shouldUpdatePresence = true;
+          }
+          if (shouldUpdatePresence && selfId.current) {
+            room.updatePresence(presenceUpdate);
+          }
+          loadChunksAround(newX, newY);
+          centerStageOnPlayer(newX, newY);
+          return { ...prev, x: newX, y: newY, specialAbilityActive, specialAbilityTimeout };
+        });
+      }
+    }, 16);
+    return () => clearInterval(moveInterval);
+  }, [keysPressed, chunks, selfState.specialAbilityActive, selfState.specialAbilityTimeout, selfUsername.current, loadChunksAround, centerStageOnPlayer, isLoading, error, selfState.x, selfState.y]);
+  useEffect(() => {
+    if (isLoading || error) return;
+    const handleKeyDown = (e) => {
+      if (document.activeElement?.closest(".tag-input")) return;
+      if (e.key === "t" && !isPlacingTag && !isGeneratingTag && selfState.score >= TAG_COST) {
+        setIsPlacingTag(true);
+      } else if (e.key === "Escape") {
+        if (isPlacingTag) {
+          setIsPlacingTag(false);
+          setTagPrompt("");
+        }
+      } else if (!isPlacingTag && !isGeneratingTag) {
+        const keyLower = e.key.toLowerCase();
+        if (["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(keyLower)) {
+          setKeysPressed((prev) => ({ ...prev, [keyLower]: true }));
+        }
+        if (keyLower === " ") {
+          handlePaint();
+          setKeysPressed((prev) => ({ ...prev, " ": true }));
+        }
+      }
+    };
+    const handleKeyUp = (e) => {
+      const keyLower = e.key.toLowerCase();
+      if (["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(keyLower)) {
+        setKeysPressed((prev) => ({ ...prev, [keyLower]: false }));
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [isPlacingTag, isGeneratingTag, selfState.score, handlePaint, isLoading, error]);
+  useEffect(() => {
+    if (isLoading || error) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    let isPainting = false;
+    const handleStageMouseDown = (e) => {
+      if (e.target === stage && !isPlacingTag && !isGeneratingTag) {
+        isPainting = true;
+        handlePaint();
+      }
+    };
+    const handleStageMouseMove = (e) => {
+      if (isPainting && !isPlacingTag && !isGeneratingTag) {
+        handlePaint();
+      }
+    };
+    const handleStageMouseUpOrLeave = () => {
+      isPainting = false;
+    };
+    stage.on("mousedown touchstart", handleStageMouseDown);
+    stage.on("mousemove touchmove", handleStageMouseMove);
+    stage.on("mouseup touchend", handleStageMouseUpOrLeave);
+    stage.on("mouseleave", handleStageMouseUpOrLeave);
+    return () => {
+      stage.off("mousedown touchstart", handleStageMouseDown);
+      stage.off("mousemove touchmove", handleStageMouseMove);
+      stage.off("mouseup touchend", handleStageMouseUpOrLeave);
+      stage.off("mouseleave", handleStageMouseUpOrLeave);
+    };
+  }, [handlePaint, isPlacingTag, isGeneratingTag, isLoading, error]);
+  const loadChunksAround = useCallback((worldX, worldY) => {
+    if (!selfId.current || typeof worldX !== "number" || typeof worldY !== "number") return;
+    const currentChunkId = getChunkId(worldX, worldY);
+    const { x: currentChunkX, y: currentChunkY } = getChunkCoords(currentChunkId);
+    const neededChunks = /* @__PURE__ */ new Set();
+    const currentLoaded = new Set(loadedChunkIds);
+    const subs = { ...chunkSubscriptions };
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const chunkId = `${currentChunkX + dx}_${currentChunkY + dy}`;
+        neededChunks.add(chunkId);
+      }
+    }
+    let updatedSubs = false;
+    let updatedLoadedIds = false;
+    neededChunks.forEach((chunkId) => {
+      if (!currentLoaded.has(chunkId)) {
+        const collectionName = getChunkCollectionName(chunkId);
+        const chunkUpdateHandler = (paintSplats) => handleChunkPaintUpdate(chunkId, paintSplats);
+        const unsubscribe = room.collection(collectionName).subscribe(chunkUpdateHandler);
+        subs[chunkId] = unsubscribe;
+        updatedSubs = true;
+        const chunkTags = room.collection(TAG_COLLECTION).filter({ chunkId }).getList();
+        setChunks((prev) => ({
+          ...prev,
+          [chunkId]: {
+            paint: prev[chunkId]?.paint || {},
+            tags: chunkTags || []
+          }
+        }));
+        setLoadedChunkIds((prev) => {
+          updatedLoadedIds = true;
+          return new Set(prev).add(chunkId);
+        });
+      }
+    });
+    currentLoaded.forEach((chunkId) => {
+      if (!neededChunks.has(chunkId)) {
+        subs[chunkId]?.();
+        delete subs[chunkId];
+        updatedSubs = true;
+        setLoadedChunkIds((prev) => {
+          const newSet = new Set(prev);
+          if (newSet.delete(chunkId)) {
+            updatedLoadedIds = true;
+          }
+          return newSet;
+        });
+        setChunks((prev) => {
+          if (prev[chunkId]) {
+            const newChunks = { ...prev };
+            delete newChunks[chunkId];
+            return newChunks;
+          }
+          return prev;
+        });
+      }
+    });
+    if (updatedSubs) {
+      setChunkSubscriptions(subs);
+    }
+  }, [loadedChunkIds, chunkSubscriptions, handleChunkPaintUpdate]);
+  const handlePaint = useCallback(() => {
+    if (isLoading || error || !selfId.current || isPlacingTag || isGeneratingTag) return;
+    const now = Date.now();
+    if (now - lastPaintTime < PAINT_COOLDOWN) return;
+    const { x, y, color, brush, specialAbilityActive } = selfState;
+    if (typeof x !== "number" || typeof y !== "number" || !color || !brush) {
+      console.warn("Attempted to paint with invalid selfState:", selfState);
+      return;
+    }
+    const chunkId = getChunkId(x, y);
+    const collectionName = getChunkCollectionName(chunkId);
+    let radius = PAINT_RADIUS[brush];
+    if (specialAbilityActive) {
+      radius *= SPECIAL_ABILITY_RADIUS_MULTIPLIER;
+    }
+    const splatData = {
+      x,
+      y,
+      color,
+      radius,
+      username: selfUsername.current,
+      timestamp: now
+    };
+    room.collection(collectionName).create(splatData).catch((err) => {
+      console.error("Error creating paint splat:", err);
+    });
+    setLastPaintTime(now);
+  }, [lastPaintTime, selfState, selfId.current, selfUsername.current, isPlacingTag, isGeneratingTag, isLoading, error]);
+  const handlePlaceTag = useCallback(async () => {
+    if (isLoading || error || !tagPrompt || isGeneratingTag || selfState.score < TAG_COST || !selfId.current) return;
+    setIsGeneratingTag(true);
+    setIsPlacingTag(false);
+    let newScore = selfState.score;
+    try {
+      console.log("Generating tag image for prompt:", tagPrompt);
+      newScore = selfState.score - TAG_COST;
+      setSelfState((prev) => ({ ...prev, score: newScore }));
+      room.updatePresence({ score: newScore });
+      const imageResult = await websim.imageGen({
+        prompt: `Pixel art sprite style: ${tagPrompt}`,
+        aspect_ratio: "1:1",
+        width: TAG_SIZE * 2,
+        height: TAG_SIZE * 2
+      });
+      if (!imageResult || !imageResult.url) {
+        throw new Error("Image generation failed or returned no URL.");
+      }
+      console.log("Tag image generated:", imageResult.url);
+      const { x, y } = selfState;
+      if (typeof x !== "number" || typeof y !== "number" || !selfUsername.current) {
+        throw new Error("Invalid player state for tag creation.");
+      }
+      const chunkId = getChunkId(x, y);
+      await room.collection(TAG_COLLECTION).create({
+        x,
+        y,
+        chunkId,
+        prompt: tagPrompt,
+        imageUrl: imageResult.url,
+        username: selfUsername.current,
+        timestamp: Date.now()
+      });
+      console.log("Tag placed successfully at", x, y);
+      setTagPrompt("");
+    } catch (err) {
+      console.error("Error placing tag:", err);
+      setSelfState((prev) => ({ ...prev, score: prev.score + TAG_COST }));
+      room.updatePresence({ score: selfState.score });
+      alert(`Error creating tag: ${err.message}`);
+    } finally {
+      setIsGeneratingTag(false);
+    }
+  }, [tagPrompt, isGeneratingTag, selfState, selfId.current, selfUsername.current, isLoading, error]);
+  useEffect(() => {
+    if (isLoading || error || !selfId.current) return;
+    const calculateScores = () => {
+      const newScores = {};
+      const activeUsernames = new Set(Object.values(players).map((p) => p.username).filter(Boolean));
+      if (selfUsername.current) {
+        activeUsernames.add(selfUsername.current);
+      }
+      if (activeUsernames.size === 0) {
+        setScores({});
+        return;
+      }
+      activeUsernames.forEach((username) => newScores[username] = 0);
+      const scoringCanvases = {};
+      const getScoringContext = (chunkId) => {
+        if (!scoringCanvases[chunkId]) {
+          try {
+            const canvas = document.createElement("canvas");
+            canvas.width = CHUNK_SIZE;
+            canvas.height = CHUNK_SIZE;
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+            if (!ctx) throw new Error("Context creation failed");
+            scoringCanvases[chunkId] = { canvas, ctx };
+          } catch (err) {
+            console.error(`Failed to create scoring canvas for chunk ${chunkId}:`, err);
+            return null;
+          }
+        }
+        scoringCanvases[chunkId].ctx.clearRect(0, 0, CHUNK_SIZE, CHUNK_SIZE);
+        return scoringCanvases[chunkId].ctx;
+      };
+      Object.entries(chunks).forEach(([chunkId, chunkData]) => {
+        if (chunkData?.paint && Object.keys(chunkData.paint).length > 0) {
+          const ctx = getScoringContext(chunkId);
+          if (!ctx) return;
+          const sortedSplats = Object.values(chunkData.paint).filter((splat) => splat && typeof splat.x === "number" && typeof splat.y === "number" && splat.timestamp).sort((a, b) => a.timestamp - b.timestamp);
+          const chunkCoords = getChunkCoords(chunkId);
+          if (!chunkCoords) return;
+          const { x: chunkOriginX, y: chunkOriginY } = chunkCoords;
+          sortedSplats.forEach((splat) => {
+            ctx.fillStyle = splat.color || "#000000";
+            ctx.beginPath();
+            const relativeX = splat.x - chunkOriginX * CHUNK_SIZE;
+            const relativeY = splat.y - chunkOriginY * CHUNK_SIZE;
+            const radius = Math.max(1, splat.radius || 10);
+            ctx.arc(relativeX, relativeY, radius, 0, Math.PI * 2);
+            ctx.fill();
+          });
+        }
+      });
+      const SAMPLE_STEP = 8;
+      Object.entries(scoringCanvases).forEach(([chunkId, { ctx }]) => {
+        if (!ctx) return;
+        try {
+          const imageData = ctx.getImageData(0, 0, CHUNK_SIZE, CHUNK_SIZE);
+          const data = imageData.data;
+          const pixelScores = {};
+          for (let y = 0; y < CHUNK_SIZE; y += SAMPLE_STEP) {
+            for (let x = 0; x < CHUNK_SIZE; x += SAMPLE_STEP) {
+              const index = (y * CHUNK_SIZE + x) * 4;
+              const r = data[index];
+              const g = data[index + 1];
+              const b = data[index + 2];
+              const a = data[index + 3];
+              if (a > 128) {
+                const hexColor = `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`.toUpperCase();
+                pixelScores[hexColor] = (pixelScores[hexColor] || 0) + SAMPLE_STEP * SAMPLE_STEP;
+              }
+            }
+          }
+          const colorToUser = {};
+          Object.values(players).forEach((p) => {
+            if (p?.color && p.username) colorToUser[p.color.toUpperCase()] = p.username;
+          });
+          if (selfState.color && selfUsername.current) colorToUser[selfState.color.toUpperCase()] = selfUsername.current;
+          Object.values(chunks[chunkId]?.paint || {}).forEach((splat) => {
+            if (splat?.color && splat.username && !colorToUser[splat.color.toUpperCase()]) {
+              colorToUser[splat.color.toUpperCase()] = splat.username;
+            }
+          });
+          Object.entries(pixelScores).forEach(([hexColor, area]) => {
+            const username = colorToUser[hexColor];
+            if (username) {
+              if (newScores[username] === void 0) newScores[username] = 0;
+              newScores[username] += area;
+            }
+          });
+        } catch (imgDataError) {
+          console.error(`Error getting/processing ImageData for chunk ${chunkId}:`, imgDataError);
+        }
+      });
+      const finalScores = {};
+      activeUsernames.forEach((username) => {
+        finalScores[username] = Math.floor(newScores[username] || 0);
+      });
+      if (JSON.stringify(scores) !== JSON.stringify(finalScores)) {
+        setScores(finalScores);
+      }
+      const newSelfScore = finalScores[selfUsername.current] || 0;
+      if (newSelfScore !== selfState.score) {
+        setSelfState((prev) => ({ ...prev, score: newSelfScore }));
+        if (Math.abs(newSelfScore - (players[selfId.current]?.score || 0)) > 50) {
+          room.updatePresence({ score: newSelfScore });
+        }
+      }
+    };
+    const scoreInterval = setInterval(calculateScores, SCORE_UPDATE_INTERVAL);
+    return () => clearInterval(scoreInterval);
+  }, [chunks, players, selfState.color, selfState.score, selfId.current, selfUsername.current, isLoading, error, scores]);
+  const sortedScores = useMemo(() => {
+    const peerData = room.peers || {};
+    return Object.entries(scores).map(([username, score]) => {
+      let clientId = null;
+      if (username === selfUsername.current) {
+        clientId = selfId.current;
+      } else {
+        const playerEntry = Object.entries(players).find(([id, p]) => p.username === username);
+        if (playerEntry) clientId = playerEntry[0];
+      }
+      const avatarUrl = clientId ? peerData[clientId]?.avatarUrl : null;
+      return { username, score, avatarUrl };
+    }).filter((s) => s.score > 0 || s.username === selfUsername.current).sort((a, b) => b.score - a.score);
+  }, [scores, players, selfId.current, selfUsername.current, room.peers]);
+  const selfPlayerData = useMemo(() => {
+    const baseData = players[selfId.current] || {};
+    return {
+      ...baseData,
+      // Synced data first
+      ...selfState,
+      // Override with local state (more up-to-date pos, color, etc.)
+      username: selfUsername.current || "You"
+      // Ensure username is set
+      // avatarImage handled separately via playerAvatars state
+    };
+  }, [players, selfState, selfId.current, selfUsername.current]);
+  if (isLoading) {
+    return /* @__PURE__ */ jsxDEV("div", { style: { padding: "20px", fontSize: "1.2em" }, children: "Loading Infinite Painter..." }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 1112,
+      columnNumber: 14
+    }, this);
+  }
+  if (error) {
+    return /* @__PURE__ */ jsxDEV("div", { style: { padding: "20px", color: "red", fontSize: "1.2em" }, children: [
+      "Error: ",
+      error
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 1115,
+      columnNumber: 15
+    }, this);
+  }
+  if (!selfId.current) {
+    return /* @__PURE__ */ jsxDEV("div", { style: { padding: "20px", color: "orange", fontSize: "1.2em" }, children: "Waiting for connection..." }, void 0, false, {
+      fileName: "<stdin>",
+      lineNumber: 1119,
+      columnNumber: 15
+    }, this);
+  }
+  return /* @__PURE__ */ jsxDEV("div", { children: [
+    /* @__PURE__ */ jsxDEV("div", { className: "controls", children: [
+      /* @__PURE__ */ jsxDEV("label", { htmlFor: "color", children: "Color:" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1127,
+        columnNumber: 12
+      }, this),
+      /* @__PURE__ */ jsxDEV(
+        "input",
+        {
+          type: "color",
+          id: "color",
+          value: selfState.color,
+          onChange: (e) => {
+            const newColor = e.target.value;
+            setSelfState((prev) => ({ ...prev, color: newColor }));
+            room.updatePresence({ color: newColor });
+          }
+        },
+        void 0,
+        false,
+        {
+          fileName: "<stdin>",
+          lineNumber: 1128,
+          columnNumber: 12
+        },
+        this
+      ),
+      /* @__PURE__ */ jsxDEV("label", { htmlFor: "brush", children: "Brush:" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1138,
+        columnNumber: 12
+      }, this),
+      /* @__PURE__ */ jsxDEV(
+        "select",
+        {
+          id: "brush",
+          value: selfState.brush,
+          onChange: (e) => {
+            const newBrush = e.target.value;
+            setSelfState((prev) => ({ ...prev, brush: newBrush }));
+            room.updatePresence({ brush: newBrush });
+          },
+          children: [
+            /* @__PURE__ */ jsxDEV("option", { value: "small", children: "Small" }, void 0, false, {
+              fileName: "<stdin>",
+              lineNumber: 1148,
+              columnNumber: 17
+            }, this),
+            /* @__PURE__ */ jsxDEV("option", { value: "medium", children: "Medium" }, void 0, false, {
+              fileName: "<stdin>",
+              lineNumber: 1149,
+              columnNumber: 17
+            }, this),
+            /* @__PURE__ */ jsxDEV("option", { value: "large", children: "Large" }, void 0, false, {
+              fileName: "<stdin>",
+              lineNumber: 1150,
+              columnNumber: 17
+            }, this)
+          ]
+        },
+        void 0,
+        true,
+        {
+          fileName: "<stdin>",
+          lineNumber: 1139,
+          columnNumber: 12
+        },
+        this
+      ),
+      /* @__PURE__ */ jsxDEV("span", { children: [
+        "Score: ",
+        selfState.score
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 1152,
+        columnNumber: 13
+      }, this),
+      /* @__PURE__ */ jsxDEV("button", { onClick: () => setIsPlacingTag(true), disabled: selfState.score < TAG_COST || isPlacingTag || isGeneratingTag, title: `Cost: ${TAG_COST} Score`, children: [
+        "Place Tag ",
+        isGeneratingTag ? "(..." : `(-${TAG_COST})`
+      ] }, void 0, true, {
+        fileName: "<stdin>",
+        lineNumber: 1153,
+        columnNumber: 13
+      }, this),
+      selfState.specialAbilityActive && /* @__PURE__ */ jsxDEV("span", { style: { color: "gold", fontWeight: "bold", marginLeft: "5px", textShadow: "0 0 3px black" }, children: "\u26A1 ACTIVE!" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1156,
+        columnNumber: 48
+      }, this)
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 1126,
+      columnNumber: 8
+    }, this),
+    /* @__PURE__ */ jsxDEV("div", { className: "score-board", children: [
+      /* @__PURE__ */ jsxDEV("h3", { children: "Scores" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1161,
+        columnNumber: 14
+      }, this),
+      sortedScores.map(({ username, score, avatarUrl }) => /* @__PURE__ */ jsxDEV("div", { children: [
+        /* @__PURE__ */ jsxDEV(
+          "img",
+          {
+            src: avatarUrl || `https://images.websim.ai/avatar/${username}?size=40&fallback=true`,
+            alt: username,
+            onError: (e) => {
+              e.target.src = "https://images.websim.ai/default-avatar.png";
+            }
+          },
+          void 0,
+          false,
+          {
+            fileName: "<stdin>",
+            lineNumber: 1164,
+            columnNumber: 22
+          },
+          this
+        ),
+        /* @__PURE__ */ jsxDEV("span", { children: username }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 1168,
+          columnNumber: 22
+        }, this),
+        /* @__PURE__ */ jsxDEV("span", { children: score }, void 0, false, {
+          fileName: "<stdin>",
+          lineNumber: 1169,
+          columnNumber: 22
+        }, this)
+      ] }, username, true, {
+        fileName: "<stdin>",
+        lineNumber: 1163,
+        columnNumber: 18
+      }, this))
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 1160,
+      columnNumber: 9
+    }, this),
+    isPlacingTag && /* @__PURE__ */ jsxDEV("div", { className: "tag-input", children: [
+      /* @__PURE__ */ jsxDEV(
+        "input",
+        {
+          type: "text",
+          placeholder: "Enter tag prompt (e.g., 'a happy cat wizard')",
+          value: tagPrompt,
+          onChange: (e) => setTagPrompt(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter" && tagPrompt && !isGeneratingTag) handlePlaceTag();
+          },
+          autoFocus: true
+        },
+        void 0,
+        false,
+        {
+          fileName: "<stdin>",
+          lineNumber: 1177,
+          columnNumber: 15
+        },
+        this
+      ),
+      /* @__PURE__ */ jsxDEV("button", { onClick: handlePlaceTag, disabled: !tagPrompt || isGeneratingTag, children: isGeneratingTag ? "Generating..." : "Create Tag" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1185,
+        columnNumber: 15
+      }, this),
+      /* @__PURE__ */ jsxDEV("button", { onClick: () => {
+        setIsPlacingTag(false);
+        setTagPrompt("");
+      }, className: "cancel-button", children: "Cancel" }, void 0, false, {
+        fileName: "<stdin>",
+        lineNumber: 1188,
+        columnNumber: 15
+      }, this)
+    ] }, void 0, true, {
+      fileName: "<stdin>",
+      lineNumber: 1176,
+      columnNumber: 11
+    }, this),
+    /* @__PURE__ */ jsxDEV(
+      Stage,
+      {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        x: stagePos.x,
+        y: stagePos.y,
+        ref: stageRef,
+        onContextMenu: (e) => e.evt.preventDefault(),
+        children: /* @__PURE__ */ jsxDEV(Layer, { ref: layerRef, imageSmoothingEnabled: false, perfectDrawEnabled: false, children: [
+          Array.from(loadedChunkIds).map((chunkId) => {
+            const chunkData = chunks[chunkId];
+            if (!chunkData) return null;
+            return /* @__PURE__ */ jsxDEV(
+              Chunk,
+              {
+                chunkId,
+                paintData: chunkData.paint || {},
+                tags: chunkData.tags || [],
+                activePlayerTags
+              },
+              chunkId,
+              false,
+              {
+                fileName: "<stdin>",
+                lineNumber: 1209,
+                columnNumber: 19
+              },
+              this
+            );
+          }),
+          Object.entries(players).map(([id, player]) => {
+            if (id === selfId.current) return null;
+            return /* @__PURE__ */ jsxDEV(
+              Player,
+              {
+                player,
+                isSelf: false,
+                color: player.color || "#888888",
+                username: player.username,
+                avatarImage: playerAvatars[id]
+              },
+              id,
+              false,
+              {
+                fileName: "<stdin>",
+                lineNumber: 1223,
+                columnNumber: 23
+              },
+              this
+            );
+          }),
+          /* @__PURE__ */ jsxDEV(
+            Player,
+            {
+              player: selfPlayerData,
+              isSelf: true,
+              color: selfPlayerData.color,
+              username: selfPlayerData.username,
+              avatarImage: playerAvatars[selfId.current]
+            },
+            selfId.current,
+            false,
+            {
+              fileName: "<stdin>",
+              lineNumber: 1234,
+              columnNumber: 12
+            },
+            this
+          )
+        ] }, void 0, true, {
+          fileName: "<stdin>",
+          lineNumber: 1202,
+          columnNumber: 9
+        }, this)
+      },
+      void 0,
+      false,
+      {
+        fileName: "<stdin>",
+        lineNumber: 1193,
+        columnNumber: 7
+      },
+      this
+    )
+  ] }, void 0, true, {
+    fileName: "<stdin>",
+    lineNumber: 1124,
+    columnNumber: 5
+  }, this);
+}
+const container = document.getElementById("root");
+if (container) {
+  const root = createRoot(container);
+  root.render(/* @__PURE__ */ jsxDEV(App, {}, void 0, false, {
+    fileName: "<stdin>",
+    lineNumber: 1253,
+    columnNumber: 17
+  }));
+} else {
+  console.error("Root element not found!");
+  document.body.innerHTML = '<div style="color: red; padding: 20px;">Error: Could not find root element to mount the application.</div>';
+}
